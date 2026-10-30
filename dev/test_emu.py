@@ -60,6 +60,14 @@ def test_nf4():
     k_nf4.nf4_layer_dequant_kernel[(tri.cdiv(nq2, 128),)](packed[:nq2 * 32], qabs[:nq2], scale2[:2],
                                                          offset2[:2], code2, nf4, out2, nq2, QB=128)
     check("dequant prefix", out2, ref[:nq2 * 64], 0.0)
+    # a range starting inside the layer (what the split attention / MLP dequant launches do)
+    q0, q1 = 256, 3 * 256
+    out3 = np.zeros(n, dtype=f16)
+    k_nf4.nf4_layer_dequant_kernel[(tri.cdiv(q1 - q0, 128),)](
+        packed[q0 * 32:q1 * 32], qabs[q0:q1], scale2[q0 // 256:q1 // 256], offset2[q0 // 256:q1 // 256],
+        code2, nf4, out3[q0 * 64:q1 * 64], q1 - q0, QB=128)
+    check("dequant range", out3[q0 * 64:q1 * 64], ref[q0 * 64:q1 * 64], 0.0)
+    check("dequant range leaves the rest", out3[:q0 * 64], np.zeros(q0 * 64), 0.0)
 
 
 # ------------------------------------------------------------------ RMSNorm
@@ -107,8 +115,9 @@ def test_norm():
     dres = rng.standard_normal((n, d)).astype(f32)
     gscale = np.array([0.75], f32)
     out = dres.copy()
-    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, h, w, r.astype(f32), out, out, lq, lv, n, p, ks, 11, 22, 1, 1,
-                                D=d, BLOCK=2048)
+    out16 = np.zeros((n, d), f16)
+    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, h, w, r.astype(f32), out, out, lq, lv, out16, n, p, ks, 11, 22,
+                                1, 1, 1, D=d, BLOCK=2048)
     dyt = dy16.astype(np.float64) * 0.75 + np.where(mq, lq.astype(np.float64) * ks, 0) + np.where(mv, lv.astype(np.float64) * ks, 0)
     hh = h.astype(np.float64)
     rr = 1.0 / np.sqrt((hh ** 2).mean(1) + eps)
@@ -116,6 +125,7 @@ def test_norm():
     g = dyt * w
     ref = rr[:, None] * (g - xh * (g * xh).mean(1, keepdims=True)) + dres
     check("rms bwd (+lora, +res, in place)", out, ref, 1e-4, 1e-4)
+    check("rms bwd fp16 copy == fp16(out)", out16, out.astype(f16), 0)
     # finite-difference check of the analytic formula on one row
     i, j = 2, 77
     def f(hrow):
