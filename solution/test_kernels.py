@@ -51,6 +51,19 @@ def test_nf4_layer_dequant_is_bit_exact():
         p = linears[name].weight
         again = bnb.functional.dequantize_4bit(p.data, p.quant_state).half()
         assert torch.equal(again, refs[name])
+    # the same layer kept in pinned host memory and streamed through the two GPU slots
+    from solution.k_nf4 import WeightStreamer, dequant_tensors
+
+    host_layer, code2h = repack_layer(linears, torch.device(DEV), host=True)
+    assert not host_layer.flat.is_cuda and host_layer.flat.is_pinned()
+    streamer = WeightStreamer([host_layer, packed], torch.device(DEV))
+    for i in (0, 1, 1, 0):
+        out2 = torch.zeros_like(out)
+        pk, qa, s2, o2 = streamer.acquire(i)
+        dequant_tensors(pk, qa, s2, o2, host_layer.n_qblocks, code2h, nf4, out2)
+        streamer.release()
+        streamer.prefetch(1 - i)
+        assert torch.equal(out2, out), f"streamed layer {i} differs"
 
 
 # ------------------------------------------------------------------ RMSNorm
@@ -136,7 +149,7 @@ def test_qkv_epilogue_forward_backward():
     dkp = torch.randn(n, nq * hd, device=DEV)
     dvp = torch.randn(n, nq * hd, device=DEV)
     out = torch.empty_like(qkv)
-    qkv_epilogue_backward(dq, dkp, dvp, pos, cos, sin, out, nq, nkv, hd)
+    qkv_epilogue_backward(dq, dkp, dvp, pos, cos, sin, out, nq, nkv, hd, nq // nkv)
     qr = q.clone().requires_grad_(True)
     kr = k.clone().requires_grad_(True)
     vr = v.clone().view(n, nkv, hd).requires_grad_(True)
@@ -148,6 +161,14 @@ def test_qkv_epilogue_forward_backward():
     _close(out[:, :nq * hd], qr.grad.reshape(n, -1), 3e-3, 2e-3, "dq")
     _close(out[:, nq * hd:(nq + nkv) * hd], kr.grad.reshape(n, -1), 1e-2, 2e-3, "dk")
     _close(out[:, (nq + nkv) * hd:], vr.grad.reshape(n, -1), 1e-2, 2e-3, "dv")
+    # SDPA layout: fp16 grads already reduced per KV head (GIN = 1)
+    dk16 = dkp.view(n, nkv, g, hd).sum(2).reshape(n, -1).half()
+    dv16 = dvp.view(n, nkv, g, hd).sum(2).reshape(n, -1).half()
+    out1 = torch.empty_like(qkv)
+    qkv_epilogue_backward(dq.half(), dk16, dv16, pos, cos, sin, out1, nq, nkv, hd, 1)
+    _close(out1[:, :nq * hd], qr.grad.reshape(n, -1), 1e-2, 3e-3, "dq (fp16 in)")
+    _close(out1[:, nq * hd:(nq + nkv) * hd], kr.grad.reshape(n, -1), 3e-2, 3e-3, "dk (reduced)")
+    _close(out1[:, (nq + nkv) * hd:], vr.grad.reshape(n, -1), 3e-2, 3e-3, "dv (reduced)")
 
 
 # ------------------------------------------------------------------ attention

@@ -62,13 +62,37 @@ LAYER_WEIGHTS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj",
 
 
 class PackedLayer:
-    """The repacked 4-bit weights of one decoder layer and their fp16 workspace layout."""
+    """The repacked 4-bit weights of one decoder layer and their fp16 workspace layout.
 
-    def __init__(self, packed, qabs, scale2, offset2, n_qblocks, segments):
-        self.packed, self.qabs, self.scale2, self.offset2 = packed, qabs, scale2, offset2
+    All four parts live in one flat uint8 buffer (`flat`), on the GPU or in pinned host memory:
+        [ packed nibbles | absmax codes | second-level scales (fp32) | offsets (fp32) ]
+    each section starting on a 64-byte boundary (`offsets`), so a host copy streams to the GPU
+    with a single H2D transfer.
+    """
+
+    def __init__(self, flat, offsets, n_qblocks, segments):
+        self.flat, self.offsets = flat, offsets
         self.n_qblocks = n_qblocks
         self.segments = segments          # name -> (start element, rows, cols)
         self.numel = n_qblocks * 64
+        self.packed, self.qabs, self.scale2, self.offset2 = section_views(flat, offsets, n_qblocks)
+
+
+def section_layout(n_qblocks):
+    """Byte offsets of the four sections and the total size of a flat layer buffer."""
+    sizes = (n_qblocks * 32, n_qblocks, (n_qblocks // 256) * 4, (n_qblocks // 256) * 4)
+    offs, at = [], 0
+    for size in sizes:
+        offs.append(at)
+        at += -(-size // 64) * 64
+    return tuple(offs), at
+
+
+def section_views(flat, offsets, n_qblocks):
+    o_pk, o_qa, o_s2, o_o2 = offsets
+    n2 = n_qblocks // 256
+    return (flat[o_pk:o_pk + n_qblocks * 32], flat[o_qa:o_qa + n_qblocks],
+            flat[o_s2:o_s2 + 4 * n2].view(torch.float32), flat[o_o2:o_o2 + 4 * n2].view(torch.float32))
 
 
 def _quant_parts(linear):
@@ -90,9 +114,19 @@ def _quant_parts(linear):
     return weight, state
 
 
-def repack_layer(linears, device):
+def layer_numel(linears):
+    """Number of 4-bit weights of a layer (sum over its seven matrices)."""
+    total = 0
+    for name in LAYER_WEIGHTS:
+        _, state = _quant_parts(linears[name])
+        total += int(state.shape[0]) * int(state.shape[1])
+    return total
+
+
+def repack_layer(linears, device, host=False, out=None):
     """Repack the seven Linear4bit modules of a layer (dict name -> module) into one PackedLayer and
-    point bitsandbytes' tensors at views of it. Returns (PackedLayer, code2 table)."""
+    point bitsandbytes' tensors at views of it (nothing is stored twice). With host=True the
+    buffer is pinned host memory and the GPU copies are released. Returns (PackedLayer, code2)."""
     parts = [(name, *_quant_parts(linears[name])) for name in LAYER_WEIGHTS]
     total = 0
     segments = {}
@@ -107,16 +141,22 @@ def repack_layer(linears, device):
         if state.state2.absmax.numel() * 256 * 64 != n:
             raise ValueError(f"{name}: unexpected second-level absmax size")
         if code2 is None:
-            code2 = state.state2.code
-        elif not torch.equal(code2, state.state2.code):
+            code2 = state.state2.code.to(device)
+        elif not torch.equal(code2, state.state2.code.to(device)):
             raise ValueError("second-level code tables differ between weights")
         segments[name] = (total, rows, cols)
         total += n
     n_qblocks = total // 64
-    packed = torch.empty(total // 2, dtype=torch.uint8, device=device)
-    qabs = torch.empty(n_qblocks, dtype=torch.uint8, device=device)
-    scale2 = torch.empty(n_qblocks // 256, dtype=torch.float32, device=device)
-    offset2 = torch.empty(n_qblocks // 256, dtype=torch.float32, device=device)
+    offsets, nbytes = section_layout(n_qblocks)
+    if out is not None:
+        if out.numel() != nbytes or out.dtype != torch.uint8:
+            raise ValueError("preallocated layer buffer has the wrong size")
+        flat = out
+    elif host:
+        flat = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    else:
+        flat = torch.empty(nbytes, dtype=torch.uint8, device=device)
+    packed, qabs, scale2, offset2 = section_views(flat, offsets, n_qblocks)
     for name, weight, state in parts:
         start, rows, cols = segments[name]
         n = rows * cols
@@ -126,20 +166,80 @@ def repack_layer(linears, device):
         qabs[q0:q1].copy_(state.absmax.reshape(-1))
         scale2[s0:s1].copy_(state.state2.absmax.reshape(-1).float())
         offset2[s0:s1].copy_(state.offset.float().reshape(1).expand(s1 - s0))
-        # bitsandbytes now reads the same bytes through views: nothing is stored twice.
         weight.data = packed[b0:b1].view(weight.data.shape)
         state.absmax = qabs[q0:q1].view(state.absmax.shape)
         state.state2.absmax = scale2[s0:s1].view(state.state2.absmax.shape)
-    return PackedLayer(packed, qabs, scale2, offset2, n_qblocks, segments), code2.float().contiguous()
+        state.offset = state.offset.to("cpu" if host else device)
+    return PackedLayer(flat, offsets, n_qblocks, segments), code2.float().contiguous()
+
+
+def dequant_tensors(packed, qabs, scale2, offset2, n_qblocks, code2, nf4, out):
+    grid = (triton.cdiv(n_qblocks, QBLOCKS_PER_PROGRAM),)
+    nf4_layer_dequant_kernel[grid](packed, qabs, scale2, offset2, code2, nf4, out, n_qblocks,
+                                   QB=QBLOCKS_PER_PROGRAM, num_warps=DEQUANT_WARPS,
+                                   enable_fp_fusion=False)
+    return out
 
 
 def dequant_layer(layer, code2, nf4, out):
-    """Dequantise every weight of `layer` into the flat fp16 buffer `out` (layer.numel elements)."""
-    grid = (triton.cdiv(layer.n_qblocks, QBLOCKS_PER_PROGRAM),)
-    nf4_layer_dequant_kernel[grid](layer.packed, layer.qabs, layer.scale2, layer.offset2, code2, nf4,
-                                   out, layer.n_qblocks, QB=QBLOCKS_PER_PROGRAM,
-                                   num_warps=DEQUANT_WARPS, enable_fp_fusion=False)
-    return out
+    """Dequantise every weight of `layer` (GPU-resident) into the flat fp16 buffer `out`."""
+    return dequant_tensors(layer.packed, layer.qabs, layer.scale2, layer.offset2, layer.n_qblocks,
+                           code2, nf4, out)
+
+
+class WeightStreamer:
+    """4-bit layers kept in pinned host memory, streamed into two GPU slots one layer ahead.
+
+    acquire(i) makes the main stream wait until layer i is in a slot (loading it now if it was not
+    prefetched) and returns its GPU views; release() records that the dequant kernel reading the
+    slot has been enqueued; prefetch(j) starts the H2D copy of layer j into the other slot on a
+    side stream, after the last kernel that read that slot. Forward walks 0..L-1 and backward
+    L-1..0, so the layer needed next is always already resident or in flight.
+    """
+
+    def __init__(self, layers, device):
+        self.layers = layers
+        self.device = device
+        n_qblocks = layers[0].n_qblocks
+        self.n_qblocks = n_qblocks
+        self.offsets, nbytes = section_layout(n_qblocks)
+        self.slots = [torch.empty(nbytes, dtype=torch.uint8, device=device) for _ in range(2)]
+        self.views = [section_views(s, self.offsets, n_qblocks) for s in self.slots]
+        self.owner = [None, None]
+        self.loaded = [None, None]      # event: copy into slot done (side stream)
+        self.freed = [None, None]       # event: last reader of slot enqueued (main stream)
+        self.current = None
+        self.stream = torch.cuda.Stream(device=device)
+
+    def _target(self):
+        if self.current is None:
+            return 0 if self.owner[0] is None else 1
+        return 1 - self.current
+
+    def prefetch(self, i):
+        if i is None or i in self.owner:
+            return
+        k = self._target()
+        with torch.cuda.stream(self.stream):
+            if self.freed[k] is not None:
+                self.stream.wait_event(self.freed[k])
+            self.slots[k].copy_(self.layers[i].flat, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        self.owner[k], self.loaded[k] = i, done
+
+    def acquire(self, i):
+        if i not in self.owner:
+            self.prefetch(i)
+        k = self.owner.index(i)
+        torch.cuda.current_stream(self.device).wait_event(self.loaded[k])
+        self.current = k
+        return self.views[k]
+
+    def release(self):
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(self.device))
+        self.freed[self.current] = ev
 
 
 def warmup_specs():

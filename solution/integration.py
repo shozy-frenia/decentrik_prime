@@ -33,9 +33,25 @@ _PLAN = contextvars.ContextVar("soup_fast_plan", default=None)
 _STATE = {"installed": False}
 
 
+def _process_age():
+    """Seconds since this process started (Linux /proc), or None."""
+    try:
+        import os
+
+        with open("/proc/self/stat") as fh:
+            start_ticks = int(fh.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as fh:
+            uptime = float(fh.read().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _log(msg):
     if config.VERBOSE:
-        print(f"[solution] {msg}", file=sys.stderr, flush=True)
+        age = _process_age()
+        stamp = f"t+{age:6.2f}s " if age is not None else ""
+        print(f"[solution] {stamp}{msg}", file=sys.stderr, flush=True)
 
 
 # --------------------------------------------------------------------------- config gate
@@ -123,6 +139,8 @@ def _patch_wrapper():
     @functools.wraps(orig_setup)
     def _setup_transformers(self, cfg, tcfg):
         plan = _plan_for(self, cfg, tcfg)
+        if plan:
+            _log("model setup starts (tokenizer, 4-bit load, PEFT)")
         token = _PLAN.set(plan)
         try:
             result = orig_setup(self, cfg, tcfg)
@@ -130,6 +148,7 @@ def _patch_wrapper():
             _PLAN.reset(token)
         self._soup_fast = None
         if plan:
+            _log("model loaded")
             self._soup_fast = _build_runner(self, cfg, tcfg)
         return result
 
@@ -141,6 +160,14 @@ def _patch_wrapper():
             if _install_on_trainer(trainer, runner):
                 from . import precompile
                 precompile.wait()
+            else:
+                runner.restore_stock()
+                self._soup_fast = None
+            _log("training starts")
+            try:
+                return orig_train(self, *args, **kwargs)
+            finally:
+                _log("training, final save and Soup's wrap-up done")
         return orig_train(self, *args, **kwargs)
 
     _setup_transformers._soup_fast = True
@@ -234,6 +261,7 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
         return self._soup_orig_compute_loss(model, inputs, return_outputs=return_outputs,
                                             num_items_in_batch=num_items_in_batch)
     inputs.pop("_prediction_loss_only", None)
+    t0 = time.perf_counter()
     loss_sum, stats = run_step(runner, batch)
 
     # HF Trainer.compute_loss + ForCausalLMLoss: sum / num_items_in_batch, else mean
@@ -259,9 +287,10 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
                                  row_tokens=m["row_tokens"])
         except Exception as exc:  # noqa: BLE001 - the recorder never raises into training
             state.fail(exc)
-    if runner.steps <= 2:
-        _log(f"step {runner.steps}: {batch.B} rows, {batch.n_real} tokens packed "
-             f"({batch.n_lab} supervised), peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+    if runner.steps <= 3:
+        _log(f"step {runner.steps}: {batch.B} rows, {batch.n_real} tokens packed of {batch.B * batch.Tm} "
+             f"({batch.n_lab} supervised), forward {time.perf_counter() - t0:.3f} s, "
+             f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
     return loss
 
 
@@ -269,6 +298,7 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
 def install():
     if _STATE["installed"]:
         return
+    _log("apply()")
     _patch_prepare_kbit()
     _patch_wrapper()
     _STATE["installed"] = True
