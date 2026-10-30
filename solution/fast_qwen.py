@@ -6,15 +6,17 @@ residual stream and fp16 GEMMs as the base run, the same summed cross-entropy ov
 tokens. How it is computed changes:
 
 * padding-free: the real tokens of the batch are packed into one [N, 1536] sequence (N is about
-  half of batch x padded length), with per-row positions and a block-diagonal causal mask in our
-  attention kernel; padding is never computed;
+  half of batch x padded length), with per-row positions; attention runs per packed row through
+  cu_seqlens (PyTorch's memory-efficient kernel, see k_attn.py); padding is never computed;
 * one autograd node for the whole model: the forward keeps only each layer's fp32 residual input
   (6 KB per token per layer, optionally in pinned host memory) and the head's d(hidden); the
   backward re-runs each layer's forward from its checkpoint and back-propagates through it by
   hand, so at most one layer's activations are alive at a time;
 * fused kernels for everything that is not a GEMM (see k_*.py); GEMMs are cuBLAS on fp16
   weights that our NF4 kernel dequantises once per layer per pass into one workspace, with Q|K|V
-  and gate|up fused into single GEMMs;
+  and gate|up fused into single GEMMs; the next layer's attention / MLP half is dequantised on a
+  side stream while the current layer's GEMMs run, and the layer at each forward/backward turn
+  is reused instead of dequantised again;
 * the LM head never materialises the full logits (k_head.py) and computes its gradient in the
   forward, scaled by the incoming grad in the backward;
 * the tied embedding is stored in fp16 (bit-exact, see integration.py).
@@ -25,12 +27,13 @@ import math
 import torch
 
 from . import config
-from .k_attn import (BWD_BLOCK, FWD_BLOCK_M, AttnMeta, attention_backward, attention_forward,
-                     block_table)
-from .k_head import head_rows
+from .k_attn import (_VARLEN_ERR, BWD_BLOCK, FWD_BLOCK_M, AttnMeta, attention_backward,
+                     attention_forward, block_table, sdpa_attention, sdpa_attention_backward,
+                     varlen_attention, varlen_attention_backward, varlen_selftest)
+from .k_head import fused_head
 from .k_mlp import gated_silu_backward, gated_silu_forward
-from .k_nf4 import (NF4_CODE, WeightStreamer, dequant_layer, dequant_tensors, layer_numel,
-                    repack_layer, section_layout)
+from .k_nf4 import (NF4_CODE, RANGE_ALIGN, WeightStreamer, dequant_layer, dequant_range,
+                    dequant_tensors, layer_numel, repack_layer, section_layout)
 from .k_norm import rms_backward, rms_forward
 from .k_rope import qkv_epilogue_backward, qkv_epilogue_forward
 
@@ -219,6 +222,22 @@ class FastQwen2:
         self.W_gu = view("gate_proj", 2 * self.I, self.D)
         self.W_d = view("down_proj", self.D, self.I)
 
+        # Dequantisation schedule. The workspace has an attention part (q|k|v|o, the first
+        # split_q quantisation blocks) and an MLP part (gate|up|down). We track which layer each
+        # part holds: the layer the forward ends with is the one the backward starts with, and the
+        # layer the backward ends with is the next forward's first, so those are never
+        # dequantised twice. With DEQUANT_OVERLAP, the next layer's part is dequantised on a side
+        # stream as soon as the main stream has issued the last GEMM reading that part (events
+        # order the two streams), so the memory-bound dequant runs under the compute-bound GEMMs.
+        self.split_q = seg["gate_proj"][0] // 64
+        _require(self.split_q % RANGE_ALIGN == 0 and seg["o_proj"][0] < seg["gate_proj"][0], "layer split")
+        self.overlap = bool(config.DEQUANT_OVERLAP) and self.streamer is None
+        self.ws_have = {"attn": None, "mlp": None}
+        self.ev_free = {"attn": torch.cuda.Event(), "mlp": torch.cuda.Event()}
+        self.ev_ready = {"attn": torch.cuda.Event(), "mlp": torch.cuda.Event()}
+        self.dq_stream = torch.cuda.Stream(device=dev) if self.overlap else None
+        self.n_dequant = 0
+
         # rotary tables from the model's own rotary module (bit-identical cos/sin)
         self.rotary = qwen.rotary_emb
         self.cos = self.sin = None
@@ -234,6 +253,19 @@ class FastQwen2:
         self.copy_stream = None
         self.host_ckpt = None
         self.steps = 0
+
+        # attention implementation: the varlen path is checked against the padded SDPA path on
+        # a small random batch first (forward and backward); any difference or error -> padded.
+        self.attn_impl = config.ATTN_IMPL
+        self.attn_note = self.attn_impl
+        if self.attn_impl == "varlen":
+            ok, err = varlen_selftest(dev, self.NQ, self.NKV, self.HD)
+            if ok:
+                self.attn_note = f"varlen (self-test max rel. err {err:.1e})"
+            else:
+                self.attn_impl = "sdpa"
+                why = _VARLEN_ERR[-1] if _VARLEN_ERR else f"max rel. err {err}"
+                self.attn_note = f"padded sdpa (varlen self-test failed: {why})"
 
     @torch.no_grad()
     def restore_stock(self):
@@ -266,14 +298,48 @@ class FastQwen2:
                 dst.copy_(src)
 
     def _dequant(self, i, nxt=None):
-        """fp16 weights of layer i into the workspace; with streaming, prefetch layer `nxt`."""
+        """Streaming mode only: fp16 weights of layer i into the workspace, prefetch layer `nxt`."""
         if self.streamer is None:
-            dequant_layer(self.packed[i], self.code2, self.nf4, self.ws)
             return
         pk, qa, s2, o2 = self.streamer.acquire(i)
         dequant_tensors(pk, qa, s2, o2, self.packed[i].n_qblocks, self.code2, self.nf4, self.ws)
+        self.n_dequant += 1
         self.streamer.release()
         self.streamer.prefetch(nxt)
+        self.ws_have = {"attn": None, "mlp": None}
+
+    def _ws_load(self, part, i):
+        """Start dequantising `part` ("attn" or "mlp") of layer i into the workspace, unless the
+        workspace already holds (or is already receiving) it."""
+        if i is None or self.ws_have[part] == i:
+            return
+        q0, q1 = (0, self.split_q) if part == "attn" else (self.split_q, self.packed[i].n_qblocks)
+        if self.overlap:
+            side = self.dq_stream
+            side.wait_event(self.ev_free[part])         # the main stream's last reader of the part
+            with torch.cuda.stream(side):
+                dequant_range(self.packed[i], q0, q1, self.code2, self.nf4, self.ws)
+            self.ev_ready[part].record(side)
+        else:
+            dequant_range(self.packed[i], q0, q1, self.code2, self.nf4, self.ws)
+        self.ws_have[part] = i
+        self.n_dequant += 1
+
+    def _ws_use(self, part, i):
+        """The main stream is about to read `part` of layer i from the workspace."""
+        if self.streamer is not None:
+            return
+        self._ws_load(part, i)
+        if self.overlap:
+            torch.cuda.current_stream(self.device).wait_event(self.ev_ready[part])
+
+    def _ws_release(self, part, nxt):
+        """The main stream has issued its last read of `part`; prefetch layer `nxt`'s part."""
+        if self.streamer is not None:
+            return
+        if self.overlap:
+            self.ev_free[part].record(torch.cuda.current_stream(self.device))
+        self._ws_load(part, nxt)
 
     def _seeds(self):
         return torch.randint(1, 2 ** 31 - 1, (2 * self.L,), generator=self.gen).tolist()
@@ -335,9 +401,10 @@ class FastQwen2:
         batch.meta = AttnMeta(views[5], views[6], views[7], len(tab_f) // 2, len(tab_b) // 2, n)
         batch.n_lab = int(valid.sum())
         batch.Tm = max(lens_l)
-        if config.ATTN_IMPL == "sdpa":
-            pad_index = row * batch.Tm + pos            # packed token -> row of a [B*Tm] padded view
-            batch.pad_index = pad_index.to(self.device)
+        batch.cu = views[5]
+        if self.attn_impl == "sdpa":
+            bt = torch.stack([row, pos]).to(self.device)   # packed token -> (row, position)
+            batch.b_idx, batch.t_idx = bt[0], bt[1]
         batch.row_sorted = row[perm]
         batch.valid_sorted = valid[perm]
         batch.n_real = n
@@ -371,50 +438,30 @@ class FastQwen2:
         """Causal attention of the packed batch. Returns (out [N, NQ*HD] fp16, context for backward).
 
         ATTN_IMPL == "triton": our varlen GQA flash-attention kernels (k_attn.py).
-        ATTN_IMPL == "sdpa": PyTorch's memory-efficient SDPA (what base Soup runs) on a zero-padded
-        [B, H, Tmax, 128] view of the packed tokens; right padding needs no mask beyond causality.
+        ATTN_IMPL == "sdpa": PyTorch's memory-efficient SDPA (what base Soup runs) on zero-padded
+        [B, H, Tmax, 128] buffers written straight from the packed tokens (one index_put each; K/V
+        expanded to the 12 query heads like repeat_kv); right padding needs only the causal mask.
         In the backward recompute (grad=True) the SDPA call records a local autograd graph that
         `_attention_backward` differentiates."""
-        if config.ATTN_IMPL == "triton":
+        if self.attn_impl == "varlen":
+            return varlen_attention(qkv, batch.cu, batch.Tm, self.NQ, self.NKV, self.HD, need_lse=grad)
+        if self.attn_impl == "triton":
             return attention_forward(qkv, batch.meta, self.NQ, self.NKV, self.HD)
-        n, B, T = batch.n, batch.B, batch.Tm
-        H, KV, HD = self.NQ, self.NKV, self.HD
-        idx = batch.pad_index
-
-        def padded(cols, heads):
-            buf = qkv.new_zeros((B * T, heads, HD))
-            buf.index_copy_(0, idx, qkv[:, cols].reshape(n, heads, HD))
-            if grad:
-                buf.requires_grad_(True)
-            return buf
-
-        qb = padded(slice(0, H * HD), H)
-        kb = padded(slice(H * HD, (H + KV) * HD), KV)
-        vb = padded(slice((H + KV) * HD, (H + 2 * KV) * HD), KV)
-        g = H // KV
-        with torch.set_grad_enabled(grad):
-            q = qb.view(B, T, H, HD).transpose(1, 2)
-            k = kb.view(B, T, KV, HD).transpose(1, 2)[:, :, None].expand(B, KV, g, T, HD).reshape(B, H, T, HD)
-            v = vb.view(B, T, KV, HD).transpose(1, 2)[:, :, None].expand(B, KV, g, T, HD).reshape(B, H, T, HD)
-            o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True,
-                                                                 scale=1.0 / math.sqrt(HD))
-        out = o.detach().transpose(1, 2).reshape(B * T, H * HD).index_select(0, idx)
-        return out, ((o, qb, kb, vb) if grad else None)
+        return sdpa_attention(qkv, batch.b_idx, batch.t_idx, batch.B, batch.Tm, self.NQ, self.NKV,
+                              self.HD, grad)
 
     def _attention_backward(self, qkv, out, actx, dout, batch):
         """(dq, dk, dv, GIN) for the QKV epilogue backward."""
-        if config.ATTN_IMPL == "triton":
+        if self.attn_impl == "varlen":
+            dq, dkp, dvp = varlen_attention_backward(actx, dout, batch.cu, batch.Tm, self.NQ,
+                                                     self.NKV, self.HD)
+            return dq, dkp, dvp, self.NQ // self.NKV
+        if self.attn_impl == "triton":
             dq, dkp, dvp = attention_backward(qkv, out, actx, dout, batch.meta, self.NQ, self.NKV, self.HD)
             return dq, dkp, dvp, self.NQ // self.NKV
-        o, qb, kb, vb = actx
-        n, B, T = batch.n, batch.B, batch.Tm
-        H, KV, HD = self.NQ, self.NKV, self.HD
-        dpad = dout.new_zeros((B * T, H * HD))
-        dpad.index_copy_(0, batch.pad_index, dout)
-        dq, dk, dv = torch.autograd.grad(o, (qb, kb, vb), dpad.view(B, T, H, HD).transpose(1, 2))
-        idx = batch.pad_index
-        return (dq.reshape(B * T, H * HD).index_select(0, idx), dk.reshape(B * T, KV * HD).index_select(0, idx),
-                dv.reshape(B * T, KV * HD).index_select(0, idx), 1)
+        dq, dk, dv = sdpa_attention_backward(actx, dout, batch.b_idx, batch.t_idx, batch.B, batch.Tm,
+                                             self.NQ, self.NKV, self.HD)
+        return dq, dk, dv, 1
 
     # ------------------------------------------------------------------ forward
     def forward(self, batch):
@@ -422,6 +469,8 @@ class FastQwen2:
         dev = self.device
         f16, f32 = torch.float16, torch.float32
         self._refresh_lora16()
+        if self.overlap:
+            self.dq_stream.wait_stream(torch.cuda.current_stream(dev))
         seeds = self._seeds()
         store = self._store(n)
         y = torch.empty((n, D), dtype=f16, device=dev)
@@ -443,20 +492,25 @@ class FastQwen2:
                             seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
                 x = x_new
             store.put(i, x)
-            self._dequant(i, i + 1 if i + 1 < self.L else None)
+            nxt = i + 1 if i + 1 < self.L else None
+            self._dequant(i, nxt)
+            self._ws_use("attn", i)
             qkv, _aq, _av, out, _actx = self._attn_part(i, y, xq, xv, batch)
             del qkv, _aq, _av, _actx
             op = torch.mm(out, self.W_o.t())
+            self._ws_release("attn", nxt)
             del out
             h1 = torch.empty((n, D), dtype=f32, device=dev)
             rms_forward(x, self.w_post[i], y2, rstd, self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
             del op
+            self._ws_use("mlp", i)
             gu = torch.mm(y2, self.W_gu.t())
             act = torch.empty((n, self.I), dtype=f16, device=dev)
             gated_silu_forward(gu, act)
             del gu
             d16 = torch.mm(act, self.W_d.t())
+            self._ws_release("mlp", nxt)
             del act
             x = h1
         del y, xq, xv, y2
@@ -473,26 +527,8 @@ class FastQwen2:
         return loss_sum, stats, saved
 
     def _head(self, yf, batch):
-        n, nl, D, V = batch.n, batch.n_lab, self.D, self.V
-        dev = self.device
-        ys = yf.index_select(0, batch.perm)          # tokens with a target first
-        stats = torch.empty((n, 4), dtype=torch.float32, device=dev)
-        dys = torch.zeros((n, D), dtype=torch.float16, device=dev)
-        chunk = max(16, int(config.HEAD_CHUNK))
-        buf = torch.empty((min(chunk, n), V), dtype=torch.float16, device=dev)
-        spans = [(s, min(s + chunk, nl), 1) for s in range(0, nl, chunk)]
-        spans += [(s, min(s + chunk, n), 0) for s in range(nl, n, chunk)]
-        for s, e, grad in spans:
-            c = e - s
-            logits = buf[:c]
-            torch.mm(ys[s:e], self.emb.t(), out=logits)
-            head_rows(logits, batch.tgt_sorted, stats, s, c, grad, config.HEAD_GRAD_SCALE)
-            if grad:
-                torch.mm(logits, self.emb, out=dys[s:e])
-        del buf, ys
-        dy = dys.index_select(0, batch.inv)
-        loss_sum = stats[:, 0].sum()
-        return loss_sum, stats, dy
+        return fused_head(yf, self.emb, batch.tgt_sorted, batch.perm, batch.inv, batch.n_lab,
+                          config.HEAD_CHUNK, config.HEAD_GRAD_SCALE)
 
     # ------------------------------------------------------------------ backward
     def backward(self, saved, g_loss):
@@ -502,8 +538,9 @@ class FastQwen2:
         f16, f32 = torch.float16, torch.float32
         gscale = (g_loss.detach().reshape(1).to(f32) / float(config.HEAD_GRAD_SCALE)).contiguous()
         dh = torch.empty((n, D), dtype=f32, device=dev)
+        dh16 = torch.empty((n, D), dtype=f16, device=dev)     # fp16 copy of dh for the GEMMs
         rms_backward(saved.pop("dy_head"), gscale, saved.pop("hf"), self.w_final, saved.pop("rstd_f"),
-                     dh, dummy16=self.dummy16, dummy32=self.dummy32)
+                     dh, out16=dh16, dummy16=self.dummy16, dummy32=self.dummy32)
         y = torch.empty((n, D), dtype=f16, device=dev)
         xq = torch.empty((n, D), dtype=f16, device=dev)
         xv = torch.empty((n, D), dtype=f16, device=dev)
@@ -518,35 +555,40 @@ class FastQwen2:
             if i > 0:
                 store.prefetch(i - 1)
             aq16, bq16, av16, bv16 = self.lora16[4 * i:4 * i + 4]
-            self._dequant(i, i - 1 if i > 0 else None)
+            prv = i - 1 if i > 0 else None
+            self._dequant(i, prv)
             # recompute the layer's forward from its checkpoint
             rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv, p_drop=self.p_drop,
                         keep_scale=self.keep_scale, seed_q=seeds[2 * i], seed_v=seeds[2 * i + 1],
                         dummy16=self.dummy16, dummy32=self.dummy32)
+            self._ws_use("attn", i)
             qkv, aq, av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=True)
             op = torch.mm(out, self.W_o.t())
             h1 = torch.empty((n, D), dtype=f32, device=dev)
             rms_forward(x, self.w_post[i], y2, rstd2, self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
             del op
+            self._ws_use("mlp", i)
             gu = torch.mm(y2, self.W_gu.t())
             # MLP backward
-            dact = torch.mm(dh.to(f16), self.W_d)
+            dact = torch.mm(dh16, self.W_d)
             gated_silu_backward(gu, dact)
             del dact
             dy2 = torch.mm(gu, self.W_gu)
+            self._ws_release("mlp", prv)        # layer i-1's MLP weights dequantise under the attention backward
             del gu
-            rms_backward(dy2, self.one, h1, self.w_post[i], rstd2, dh, dres=dh,
+            rms_backward(dy2, self.one, h1, self.w_post[i], rstd2, dh, dres=dh, out16=dh16,
                          dummy16=self.dummy16, dummy32=self.dummy32)
             del dy2, h1
             # attention backward
-            dout = torch.mm(dh.to(f16), self.W_o)
+            dout = torch.mm(dh16, self.W_o)
             dq, dk, dv, gin = self._attention_backward(qkv, out, actx, dout, batch)
             del out, actx, dout
             qkv_epilogue_backward(dq, dk, dv, batch.pos, self.cos, self.sin, qkv,
                                   self.NQ, self.NKV, self.HD, gin)
             del dq, dk, dv
             dy1 = torch.mm(qkv, self.W_qkv)
+            self._ws_release("attn", prv)
             gq = qkv[:, :self.NQ * self.HD]
             gv = qkv[:, (self.NQ + self.NKV) * self.HD:]
             # LoRA gradients (fp16 GEMMs like autocast's, accumulated into fp32 grads)
@@ -561,7 +603,8 @@ class FastQwen2:
             del qkv, gq, gv, aq, av, daq, dav
             rms_backward(dy1, self.one, x, self.w_in[i], rstd1, dh, dres=dh, lq=lqx, lv=lvx,
                          p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
-                         seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
+                         seed_v=seeds[2 * i + 1], out16=dh16 if i > 0 else None,
+                         dummy16=self.dummy16, dummy32=self.dummy32)
             del dy1, lqx, lvx, x
             store.drop(i)
             grads[4 * i:4 * i + 4] = [d_aq, d_bq, d_av, d_bv]
@@ -700,12 +743,18 @@ def warmup_specs(runner_cfg=None):
     hidden, nq, nkv, hd, inter = 1536, 12, 2, 128, 8960
     if runner_cfg is not None:
         hidden, nq, nkv, hd, inter = runner_cfg
-    triton_attn = config.ATTN_IMPL == "triton"
-    specs = (k_nf4.warmup_specs() + k_norm.warmup_specs(hidden)
-             + k_rope.warmup_specs(nq, nkv, hd, nq // nkv if triton_attn else 1,
-                                   _torch.float32 if triton_attn else _torch.float16)
+    impl = config.ATTN_IMPL
+    f16, f32 = _torch.float16, _torch.float32
+    if impl == "triton":
+        epi = k_rope.warmup_specs(nq, nkv, hd, nq // nkv, f32)
+    elif impl == "varlen":
+        # the varlen path (GIN = 6 partials) and its padded-SDPA fallback (GIN = 1)
+        epi = k_rope.warmup_specs(nq, nkv, hd, nq // nkv, f16) + k_rope.warmup_specs(nq, nkv, hd, 1, f16)[1:]
+    else:
+        epi = k_rope.warmup_specs(nq, nkv, hd, 1, f16)
+    specs = (k_nf4.warmup_specs() + k_norm.warmup_specs(hidden) + epi
              + k_mlp.warmup_specs(inter) + k_head.warmup_specs())
-    if triton_attn:
+    if impl == "triton":
         specs += k_attn.warmup_specs(nq, nkv, hd)
     return specs
 

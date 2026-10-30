@@ -52,9 +52,9 @@ def rms_fwd_kernel(x_ptr, delta_ptr, xout_ptr, w_ptr, y_ptr, rstd_ptr, xq_ptr, x
         tl.store(xv_ptr + off, tl.where(keep_v, y * keep_scale, 0.0).to(tl.float16), mask=cm)
 
 
-@triton.jit(do_not_specialize=["n_rows", "seed_q", "seed_v", "use_lora", "has_res"])
+@triton.jit(do_not_specialize=["n_rows", "seed_q", "seed_v", "use_lora", "has_res", "write16"])
 def rms_bwd_kernel(dy_ptr, gscale_ptr, x_ptr, w_ptr, rstd_ptr, dres_ptr, out_ptr, lq_ptr, lv_ptr,
-                   n_rows, p_drop, keep_scale, seed_q, seed_v, use_lora, has_res,
+                   out16_ptr, n_rows, p_drop, keep_scale, seed_q, seed_v, use_lora, has_res, write16,
                    D: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -78,6 +78,9 @@ def rms_bwd_kernel(dy_ptr, gscale_ptr, x_ptr, w_ptr, rstd_ptr, dres_ptr, out_ptr
     if has_res != 0:
         dx += tl.load(dres_ptr + off, mask=cm, other=0.0)
     tl.store(out_ptr + off, dx, mask=cm)
+    if write16 != 0:
+        # the fp16 copy the next GEMM consumes (autocast's cast of the residual grad)
+        tl.store(out16_ptr + off, dx.to(tl.float16), mask=cm)
 
 
 def rms_forward(x, w, y, rstd, eps, *, delta=None, xout=None, xq=None, xv=None,
@@ -93,14 +96,15 @@ def rms_forward(x, w, y, rstd, eps, *, delta=None, xout=None, xq=None, xv=None,
 
 
 def rms_backward(dy16, gscale, x, w, rstd, out, *, dres=None, lq=None, lv=None, p_drop=0.0,
-                 keep_scale=1.0, seed_q=0, seed_v=0, dummy16=None, dummy32=None):
+                 keep_scale=1.0, seed_q=0, seed_v=0, out16=None, dummy16=None, dummy32=None):
     n, d = x.shape
     use_lora = lq is not None
     rms_bwd_kernel[(n,)](
         dy16, gscale, x, w, rstd, dres if dres is not None else dummy32, out,
         lq if use_lora else dummy16, lv if use_lora else dummy16,
+        out16 if out16 is not None else dummy16,
         n, float(p_drop), float(keep_scale), int(seed_q), int(seed_v), int(use_lora),
-        int(dres is not None), D=d, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)
+        int(dres is not None), int(out16 is not None), D=d, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)
 
 
 def warmup_specs(hidden):
@@ -109,6 +113,6 @@ def warmup_specs(hidden):
     return [
         (rms_fwd_kernel, (f32, f16, f32, f32, f16, f32, f16, f16, 1, 1e-6, 0.05, 1.05, 1, 1, 1, 1, 1),
          dict(D=hidden, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)),
-        (rms_bwd_kernel, (f16, f32, f32, f32, f32, f32, f32, f16, f16, 1, 0.05, 1.05, 1, 1, 1, 1),
+        (rms_bwd_kernel, (f16, f32, f32, f32, f32, f32, f32, f16, f16, f16, 1, 0.05, 1.05, 1, 1, 1, 1, 1),
          dict(D=hidden, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)),
     ]

@@ -84,6 +84,37 @@ def head_rows(logits, tgt, stats, row0, n_rows, do_grad, grad_scale):
                                    float(grad_scale), BLOCK_V=HEAD_BLOCK_V, num_warps=HEAD_WARPS)
 
 
+def fused_head(yf, emb, tgt_sorted, perm, inv, n_lab, chunk, grad_scale):
+    """LM head over the packed tokens without full logits.
+
+    yf [N, D] fp16 final-norm output, emb [V, D] fp16 tied embedding, tgt_sorted [N] int32 targets
+    (-1 = none) in the order `perm` (tokens with a target first, n_lab of them), inv its inverse.
+    Returns (loss_sum fp32 scalar, stats [N, 4] in sorted order, dY [N, D] fp16 = grad_scale *
+    d(sum CE)/d(yf) in token order). Logits exist for `chunk` tokens at a time; supervised chunks
+    turn their logits into the scaled softmax gradient in place and one GEMM gives dY."""
+    import torch
+
+    n, d = yf.shape
+    v = emb.shape[0]
+    ys = yf.index_select(0, perm)
+    stats = torch.empty((n, 4), dtype=torch.float32, device=yf.device)
+    dys = torch.zeros((n, d), dtype=torch.float16, device=yf.device)
+    chunk = max(16, int(chunk))
+    buf = torch.empty((min(chunk, n), v), dtype=torch.float16, device=yf.device)
+    spans = [(s0, min(s0 + chunk, n_lab), 1) for s0 in range(0, n_lab, chunk)]
+    spans += [(s0, min(s0 + chunk, n), 0) for s0 in range(n_lab, n, chunk)]
+    for s0, s1, grad in spans:
+        c = s1 - s0
+        logits = buf[:c]
+        torch.mm(ys[s0:s1], emb.t(), out=logits)
+        head_rows(logits, tgt_sorted, stats, s0, c, grad, grad_scale)
+        if grad:
+            torch.mm(logits, emb, out=dys[s0:s1])
+    del buf, ys
+    dy = dys.index_select(0, inv)
+    return stats[:, 0].sum(), stats, dy
+
+
 def warmup_specs():
     import torch
     return [(lm_head_rows_kernel, (torch.float16, torch.int32, torch.float32, 1, 1, 1, 1, 1.0),

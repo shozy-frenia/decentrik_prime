@@ -6,10 +6,17 @@ Change them here and push; nothing reads environment variables.
 # Use the fast path (our own forward/backward with Triton kernels). False = stock Soup + example.
 FAST_PATH = True
 
-# Attention: "sdpa" = PyTorch's memory-efficient SDPA kernel on a padded view of the packed batch
-# (what base Soup runs); "triton" = our varlen GQA flash-attention kernels (k_attn.py), which are
-# correct but ~40x slower than expected on the T4 (sm_75) in our measurements, so they are off.
-ATTN_IMPL = "sdpa"
+# Attention:
+#   "varlen" = PyTorch's memory-efficient attention kernel (the one SDPA uses on a T4, i.e. what
+#              base Soup runs) called on the packed tokens with cu_seqlens: no padding, no
+#              scatter/gather. Checked against "sdpa" at start-up; falls back to it on any mismatch.
+#   "sdpa"   = the same kernel through SDPA on a zero-padded [B, H, Tmax, 128] view of the batch.
+#   "triton" = our own varlen GQA flash-attention kernels (k_attn.py): correct, but Triton 3.6 runs
+#              tl.dot on the FMA units below sm_80 (no tensor cores on the T4), ~40x slower.
+ATTN_IMPL = "varlen"
+
+# Dequantise the next layer's weights on a side stream while the current layer's GEMMs run.
+DEQUANT_OVERLAP = True
 
 # Tokens per chunk of the fused LM head (logits are only ever materialised for this many rows:
 # CHUNK x 151936 x 2 bytes, 78 MB at 256).

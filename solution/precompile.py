@@ -1,7 +1,8 @@
 """Ahead-of-time compilation of every Triton kernel of the fast path, in background threads.
 
 Triton compiles a kernel the first time it is launched; for a dozen kernels that is several
-seconds of the measured wall time. apply() starts the compilation right away, in daemon threads,
+seconds of the measured wall time (plus a gcc build of its C launcher at the first launch). apply()
+starts the compilation right away, in daemon threads,
 using Triton's own `JITFunction.warmup` with the exact dtypes, constexprs and launch options the
 real launches use (all runtime integers are `do_not_specialize`, pointers are 16-byte aligned on
 both sides), so each later launch finds its binary in the in-memory kernel cache. The heavy
@@ -28,7 +29,13 @@ def _compile(specs):
         name = getattr(getattr(kernel, "fn", None), "__name__", str(kernel))
         start = time.perf_counter()
         try:
-            kernel.warmup(*args, grid=(1,), **kwargs)
+            compiled = kernel.warmup(*args, grid=(1,), **kwargs)
+            # Triton builds each kernel's C launcher (a gcc run) and loads the cubin only at the
+            # first real launch (CompiledKernel._init_handles); doing it here keeps ~0.3 s per
+            # kernel signature out of the first training step.
+            init = getattr(compiled, "_init_handles", None)
+            if init is not None:
+                init()
         except Exception as exc:  # noqa: BLE001 - the real launch will compile (and report) it
             _errors.append(f"{name}: {type(exc).__name__}: {exc}")
         _timing[name] = round(time.perf_counter() - start, 2)

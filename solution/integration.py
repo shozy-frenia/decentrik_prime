@@ -193,7 +193,8 @@ def _build_runner(wrapper, cfg, tcfg):
         _restore_fp32_embedding(model)
         return None
     _log(f"fast path ready in {time.perf_counter() - started:.2f} s "
-         f"(peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated so far)")
+         f"(peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated so far); "
+         f"attention: {runner.attn_note}; dequant overlap: {runner.overlap}")
     return runner
 
 
@@ -290,7 +291,8 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
     if runner.steps <= 3:
         _log(f"step {runner.steps}: {batch.B} rows, {batch.n_real} tokens packed of {batch.B * batch.Tm} "
              f"({batch.n_lab} supervised), forward {time.perf_counter() - t0:.3f} s, "
-             f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+             f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, "
+             f"{runner.n_dequant} half-layer dequants so far")
     return loss
 
 

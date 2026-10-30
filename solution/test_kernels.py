@@ -51,6 +51,22 @@ def test_nf4_layer_dequant_is_bit_exact():
         p = linears[name].weight
         again = bnb.functional.dequantize_4bit(p.data, p.quant_state).half()
         assert torch.equal(again, refs[name])
+    # split dequantisation (attention part / MLP part), the second one on a side stream
+    from solution.k_nf4 import RANGE_ALIGN, dequant_range
+
+    split = RANGE_ALIGN
+    assert packed.n_qblocks > split
+    out3 = torch.zeros_like(out)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        dequant_range(packed, split, packed.n_qblocks, code2, nf4, out3)
+    torch.cuda.current_stream().wait_stream(side)
+    assert not out3[:split * 64].any(), "range dequant wrote outside its range"
+    dequant_range(packed, 0, split, code2, nf4, out3)
+    assert torch.equal(out3, out), "split dequant differs from the whole-layer dequant"
+    with pytest.raises(ValueError):
+        dequant_range(packed, 256, packed.n_qblocks, code2, nf4, out3)
     # the same layer kept in pinned host memory and streamed through the two GPU slots
     from solution.k_nf4 import WeightStreamer, dequant_tensors
 
@@ -110,9 +126,11 @@ def test_rmsnorm_forward_backward_and_dropout():
     upstream = dy16.double() * 0.5 + keep_q.double() * lq.double() * ks + keep_v.double() * lv.double() * ks
     (yy * upstream).sum().backward()
     out = dres.clone()
+    out16 = torch.empty(n, d, dtype=torch.float16, device=DEV)
     rms_backward(dy16, gscale, h, w, rstd, out, dres=out, lq=lq, lv=lv, p_drop=p, keep_scale=ks,
-                 seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+                 seed_q=123, seed_v=456, out16=out16, dummy16=d16, dummy32=d32)
     _close(out, hh.grad + dres.double(), 1e-4, 1e-4, "rms backward")
+    assert torch.equal(out16, out.half())
 
 
 # ------------------------------------------------------------------ QKV epilogue (LoRA add + RoPE)
@@ -214,6 +232,56 @@ def test_varlen_causal_gqa_attention(lens):
     _close(dq.view(n, nq, hd), q.grad, 3e-2, 2e-2, "dq")
     _close(dkp.view(n, nkv, g, hd).sum(2), k.grad, 3e-2, 2e-2, "dk")
     _close(dvp.view(n, nkv, g, hd).sum(2), v.grad, 3e-2, 2e-2, "dv")
+
+
+@pytest.mark.parametrize("lens", [[1, 37, 64, 200], [512, 511, 3, 129]])
+def test_varlen_efficient_attention_path(lens):
+    """The default attention path: PyTorch's memory-efficient kernel with cu_seqlens on the packed
+    tokens, against per-sequence fp32 SDPA; then its fp16 per-query-head dK/dV partials through our
+    QKV epilogue backward (GIN = 6)."""
+    from solution.k_attn import varlen_attention, varlen_attention_backward, varlen_selftest
+    from solution.k_rope import qkv_epilogue_backward
+
+    ok, err = varlen_selftest(torch.device(DEV))
+    assert ok, f"varlen self-test failed ({err})"
+    torch.manual_seed(6)
+    nq, nkv, hd = 12, 2, 128
+    g = nq // nkv
+    n = sum(lens)
+    qkv = (torch.randn(n, (nq + 2 * nkv) * hd, device=DEV) * 0.8).half()
+    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.int32, device=DEV)
+    out, ctx = varlen_attention(qkv, cu, max(lens), nq, nkv, hd, need_lse=True)
+    q = qkv[:, :nq * hd].float().view(n, nq, hd).requires_grad_(True)
+    k = qkv[:, nq * hd:(nq + nkv) * hd].float().view(n, nkv, hd).requires_grad_(True)
+    v = qkv[:, (nq + nkv) * hd:].float().view(n, nkv, hd).requires_grad_(True)
+    outs, s0 = [], 0
+    for L in lens:
+        sl = slice(s0, s0 + L)
+        qq = q[sl].transpose(0, 1)
+        kk = k[sl].transpose(0, 1).repeat_interleave(g, 0)
+        vv = v[sl].transpose(0, 1).repeat_interleave(g, 0)
+        o = torch.nn.functional.scaled_dot_product_attention(qq[None], kk[None], vv[None], is_causal=True,
+                                                             scale=1.0 / math.sqrt(hd))[0]
+        outs.append(o.transpose(0, 1))
+        s0 += L
+    ref = torch.cat(outs).reshape(n, nq * hd)
+    _close(out, ref, 3e-3, 3e-3, "attention out")
+    dout = torch.randn(n, nq * hd, device=DEV).half()
+    ref.backward(dout.float())
+    dq, dkp, dvp = varlen_attention_backward(ctx, dout, cu, max(lens), nq, nkv, hd)
+    assert dq.is_contiguous() and dkp.shape == (n, nq * hd) and dkp.dtype == torch.float16
+    _close(dq.view(n, nq, hd), q.grad, 3e-2, 2e-2, "dq")
+    _close(dkp.float().view(n, nkv, g, hd).sum(2), k.grad, 3e-2, 2e-2, "dk")
+    _close(dvp.float().view(n, nkv, g, hd).sum(2), v.grad, 3e-2, 2e-2, "dv")
+    # the epilogue backward sums the fp16 partials exactly like it sums fp32 ones
+    pos = torch.cat([torch.arange(L) for L in lens]).to(DEV).int()
+    cos = torch.randn(1024, hd, device=DEV)
+    sin = torch.randn(1024, hd, device=DEV)
+    o16 = torch.empty_like(qkv)
+    o32 = torch.empty_like(qkv)
+    qkv_epilogue_backward(dq, dkp, dvp, pos, cos, sin, o16, nq, nkv, hd, g)
+    qkv_epilogue_backward(dq.float(), dkp.float(), dvp.float(), pos, cos, sin, o32, nq, nkv, hd, g)
+    assert torch.equal(o16, o32)
 
 
 # ------------------------------------------------------------------ gated SiLU

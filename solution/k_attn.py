@@ -199,19 +199,22 @@ class AttnMeta:
         self.n_fwd, self.n_bwd, self.n_tokens = n_fwd, n_bwd, n_tokens
 
 
-def attention_forward(qkv, meta, nq, nkv, hd):
+def attention_forward(qkv, meta, nq, nkv, hd, block_m=FWD_BLOCK_M, block_n=FWD_BLOCK_N,
+                      warps=ATTN_WARPS):
+    """meta.tab_fwd must be the block table for `block_m`."""
     n = meta.n_tokens
     out = torch.empty((n, nq * hd), dtype=torch.float16, device=qkv.device)
     lse = torch.empty((nq, n), dtype=torch.float32, device=qkv.device)
     sm_scale = 1.0 / math.sqrt(hd)
     attn_fwd_kernel[(meta.n_fwd, nq)](qkv, out, lse, meta.cu, meta.tab_fwd, n, sm_scale * LOG2E,
-                                      NQ=nq, NKV=nkv, HD=hd, BLOCK_M=FWD_BLOCK_M,
-                                      BLOCK_N=FWD_BLOCK_N, num_warps=ATTN_WARPS)
+                                      NQ=nq, NKV=nkv, HD=hd, BLOCK_M=block_m,
+                                      BLOCK_N=block_n, num_warps=warps)
     return out, lse
 
 
-def attention_backward(qkv, out, lse, dout, meta, nq, nkv, hd):
-    """Returns fp32 dq [N, nq*hd] and per-query-head dk, dv partials [N, nq*hd]."""
+def attention_backward(qkv, out, lse, dout, meta, nq, nkv, hd, block=BWD_BLOCK, warps=ATTN_WARPS):
+    """Returns fp32 dq [N, nq*hd] and per-query-head dk, dv partials [N, nq*hd].
+    meta.tab_bwd must be the block table for `block`."""
     n = meta.n_tokens
     dev = qkv.device
     sm_scale = 1.0 / math.sqrt(hd)
@@ -223,11 +226,145 @@ def attention_backward(qkv, out, lse, dout, meta, nq, nkv, hd):
     dvp = torch.empty((n, nq * hd), dtype=torch.float32, device=dev)
     attn_bwd_dkdv_kernel[(meta.n_bwd, nq)](qkv, dout, lse, delta, dkp, dvp, meta.cu, meta.tab_bwd,
                                            n, sm_scale * LOG2E, sm_scale, NQ=nq, NKV=nkv, HD=hd,
-                                           BLOCK=BWD_BLOCK, num_warps=ATTN_WARPS)
+                                           BLOCK=block, num_warps=warps)
     attn_bwd_dq_kernel[(meta.n_bwd, nq)](qkv, dout, lse, delta, dq, meta.cu, meta.tab_bwd,
                                          n, sm_scale * LOG2E, sm_scale, NQ=nq, NKV=nkv, HD=hd,
-                                         BLOCK=BWD_BLOCK, num_warps=ATTN_WARPS)
+                                         BLOCK=block, num_warps=warps)
     return dq, dkp, dvp
+
+
+# --------------------------------------------------------------------------- varlen path
+# Why not our Triton kernels above: Triton 3.6 lowers tl.dot to tensor cores (MMA) only on
+# compute capability >= 8.0; on the T4 (sm_75) AccelerateMatmul emits "Dot op using MMA for
+# compute capability 75 has been deprecated. It falls back to the FMA path", so every tl.dot
+# runs on the fp32 FMA units (~8 TFLOP/s peak instead of 65). That is the ~40x we measured.
+# The attention therefore uses the tensor-core kernel PyTorch itself ships for sm_75 (the
+# memory-efficient attention behind SDPA, the one base Soup runs), called the way PyTorch's own
+# nested-tensor SDPA calls it: on the packed tokens with cu_seqlens, so the four rows are four
+# independent causal sequences and no padding is computed, zero-filled, scattered or gathered.
+_VARLEN_ERR = []
+
+
+def _call_by_name(op, values):
+    """Call an aten overload with keyword arguments taken from its schema (argument lists differ
+    between torch versions). Unknown keyword-only arguments keep their defaults; an unknown
+    positional argument means a signature we do not know, so we refuse."""
+    kwargs = {}
+    for arg in op._schema.arguments:
+        if arg.name in values:
+            kwargs[arg.name] = values[arg.name]
+        elif not arg.kwarg_only:
+            raise RuntimeError(f"{op} has an unexpected argument {arg.name}")
+    return op(**kwargs)
+
+
+def varlen_attention(qkv, cu, max_len, nq, nkv, hd, need_lse=False):
+    """Causal GQA attention of the packed batch through aten::_efficient_attention_forward with
+    cu_seqlens (custom_mask_type 1 = causal from the top-left of each sequence). Q is a strided
+    view of the fused QKV buffer; K/V are expanded to the query heads (the kernel wants equal head
+    counts, like repeat_kv). Returns (out [N, nq*hd] fp16, context for the backward or None)."""
+    n = qkv.shape[0]
+    g = nq // nkv
+    q = qkv[:, :nq * hd].view(1, n, nq, hd)
+    k = qkv[:, nq * hd:(nq + nkv) * hd].view(n, nkv, 1, hd).expand(n, nkv, g, hd).reshape(1, n, nq, hd)
+    v = qkv[:, (nq + nkv) * hd:].view(n, nkv, 1, hd).expand(n, nkv, g, hd).reshape(1, n, nq, hd)
+    res = _call_by_name(torch.ops.aten._efficient_attention_forward.default, dict(
+        query=q, key=k, value=v, bias=None, cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=int(max_len), max_seqlen_k=int(max_len), dropout_p=0.0, custom_mask_type=1,
+        compute_log_sumexp=bool(need_lse), scale=1.0 / math.sqrt(hd)))
+    o = res[0]
+    out = o.reshape(n, nq * hd)
+    if not out.is_contiguous():
+        out = out.contiguous()
+    ctx = (q, k, v, o, res[1], res[2], res[3]) if need_lse else None
+    return out, ctx
+
+
+def varlen_attention_backward(ctx, dout, cu, max_len, nq, nkv, hd):
+    """(dq [N, nq*hd], dk [N, nq*hd], dv [N, nq*hd]) fp16; dk/dv are per-query-head partials
+    (6 per KV head) that the QKV epilogue backward sums (GIN = nq // nkv)."""
+    q, k, v, o, lse, seed, offset = ctx
+    n = dout.shape[0]
+    grads = _call_by_name(torch.ops.aten._efficient_attention_backward.default, dict(
+        grad_out_=dout.view(1, n, nq, hd), query=q, key=k, value=v, bias=None, out=o,
+        cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=int(max_len), max_seqlen_k=int(max_len),
+        logsumexp=lse, dropout_p=0.0, philox_seed=seed, philox_offset=offset, custom_mask_type=1,
+        bias_requires_grad=False, scale=1.0 / math.sqrt(hd), shared_storage_dqdkdv=False))
+    out = []
+    for t in grads[:3]:
+        t = t.reshape(n, nq * hd)
+        out.append(t if t.is_contiguous() else t.contiguous())
+    return tuple(out)
+
+
+def varlen_selftest(device, nq=12, nkv=2, hd=128, lens=(37, 70, 5, 64)):
+    """Compare the varlen path with the padded SDPA path on a small random batch (forward and
+    backward). Returns (ok, worst relative error); any exception counts as failure."""
+    try:
+        gen = torch.Generator(device="cpu").manual_seed(1234)
+        n, B, T = sum(lens), len(lens), max(lens)
+        qkv = (torch.randn(n, (nq + 2 * nkv) * hd, generator=gen) * 0.7).half().to(device)
+        dout = torch.randn(n, nq * hd, generator=gen).half().to(device)
+        cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.int32,
+                          device=device)
+        row = torch.cat([torch.full((L,), b) for b, L in enumerate(lens)]).to(device)
+        pos = torch.cat([torch.arange(L) for L in lens]).to(device)
+        ref_out, rctx = sdpa_attention(qkv, row, pos, B, T, nq, nkv, hd, grad=True)
+        rq, rk, rv = sdpa_attention_backward(rctx, dout, row, pos, B, T, nq, nkv, hd)
+        out, ctx = varlen_attention(qkv, cu, T, nq, nkv, hd, need_lse=True)
+        out2, _ = varlen_attention(qkv, cu, T, nq, nkv, hd, need_lse=False)
+        dq, dk, dv = varlen_attention_backward(ctx, dout, cu, T, nq, nkv, hd)
+        g = nq // nkv
+        dk = dk.float().view(n, nkv, g, hd).sum(2).reshape(n, nkv * hd)
+        dv = dv.float().view(n, nkv, g, hd).sum(2).reshape(n, nkv * hd)
+
+        def rel(a, b):
+            a, b = a.float(), b.float()
+            return float((a - b).abs().max() / b.abs().max().clamp_min(1e-6))
+
+        errs = [rel(out, ref_out), rel(out2, ref_out), rel(dq, rq), rel(dk, rk), rel(dv, rv)]
+        worst = max(errs)
+        return bool(worst < 2e-2 and all(math.isfinite(e) for e in errs)), worst
+    except Exception as exc:  # noqa: BLE001
+        _VARLEN_ERR.append(f"{type(exc).__name__}: {exc}")
+        return False, float("nan")
+
+
+# --------------------------------------------------------------------------- SDPA path
+def sdpa_attention(qkv, b_idx, t_idx, B, T, nq, nkv, hd, grad=False):
+    """PyTorch SDPA (memory-efficient kernel on sm_75, what base Soup runs) on zero-padded
+    [B, H, T, hd] buffers written straight from the packed tokens: one index_put per tensor, K/V
+    expanded to the query heads through a broadcast view (like repeat_kv). Right padding needs
+    only the causal mask. With grad=True the call records a small autograd graph rooted at the
+    packed q/k/v views, so sdpa_attention_backward gets packed, GQA-reduced gradients.
+    Returns (out [N, nq*hd] fp16, context)."""
+    n = qkv.shape[0]
+    g = nq // nkv
+    q_p = qkv[:, :nq * hd].reshape(n, nq, hd).detach().requires_grad_(grad)
+    k_p = qkv[:, nq * hd:(nq + nkv) * hd].reshape(n, nkv, hd).detach().requires_grad_(grad)
+    v_p = qkv[:, (nq + nkv) * hd:].reshape(n, nkv, hd).detach().requires_grad_(grad)
+    with torch.set_grad_enabled(grad):
+        qb = qkv.new_zeros((B, nq, T, hd))
+        qb.permute(0, 2, 1, 3)[b_idx, t_idx] = q_p
+        kb = qkv.new_zeros((B, nq, T, hd))
+        kb.view(B, nkv, g, T, hd).permute(0, 3, 1, 2, 4)[b_idx, t_idx] = k_p[:, :, None].expand(n, nkv, g, hd)
+        vb = qkv.new_zeros((B, nq, T, hd))
+        vb.view(B, nkv, g, T, hd).permute(0, 3, 1, 2, 4)[b_idx, t_idx] = v_p[:, :, None].expand(n, nkv, g, hd)
+        o = torch.nn.functional.scaled_dot_product_attention(qb, kb, vb, is_causal=True,
+                                                             scale=1.0 / math.sqrt(hd))
+    out = o.detach().permute(0, 2, 1, 3)[b_idx, t_idx].reshape(n, nq * hd)
+    return out, ((o, q_p, k_p, v_p) if grad else None)
+
+
+def sdpa_attention_backward(ctx, dout, b_idx, t_idx, B, T, nq, nkv, hd):
+    """(dq [N, nq*hd], dk [N, nkv*hd], dv [N, nkv*hd]) fp16, packed."""
+    o, q_p, k_p, v_p = ctx
+    n = dout.shape[0]
+    dpad = dout.new_zeros((B, nq, T, hd))
+    dpad.permute(0, 2, 1, 3)[b_idx, t_idx] = dout.view(n, nq, hd)
+    dq, dk, dv = torch.autograd.grad(o, (q_p, k_p, v_p), dpad)
+    return (dq.reshape(n, nq * hd).contiguous(), dk.reshape(n, nkv * hd).contiguous(),
+            dv.reshape(n, nkv * hd).contiguous())
 
 
 def warmup_specs(nq, nkv, hd):
