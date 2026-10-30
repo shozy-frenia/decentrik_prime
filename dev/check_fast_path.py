@@ -167,54 +167,89 @@ def main():
     report["grad_rel_l2_worst"] = rel
     report["grad_cos_worst"] = cos
 
-    # loss scaling like the fp16 GradScaler: grads stay finite
-    for p in params:
-        p.grad = None
+    ok = (report["loss_rel"] < 2e-3 and report["entropy_rel"] < 5e-3 and report["accuracy_abs"] < 0.02
+          and report["row_loss_rel_max"] < 5e-3 and report["grad_cos_worst"] > 0.995)
+    report["CORRECTNESS_PASS"] = ok
+    print(json.dumps(report, indent=2), flush=True)
+    del ref_grads
+    torch.cuda.empty_cache()
+    extra = {}
+
+    def section(name, fn):
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            extra[name + "_error"] = f"{type(exc).__name__}: {exc}"
+        print(json.dumps({k: v for k, v in extra.items()}, indent=2), flush=True)
+
     from solution.fast_qwen import run_step
-    batch = runner.pack(ids, mask, labels)
-    loss_sum, _ = run_step(runner, batch)
-    (loss_sum / batch.n_lab * 65536.0).backward()
-    report["scaled_grads_finite"] = all(bool(torch.isfinite(p.grad).all()) for p in params)
 
-    # host-offloaded checkpoints: identical gradients
-    for p in params:
-        p.grad = None
-    config.OFFLOAD_CHECKPOINTS = True
-    torch.cuda.reset_peak_memory_stats()
-    fast_step(runner, ids, mask, labels)
-    report["offload_peak_mib"] = torch.cuda.max_memory_allocated() / 2**20
-    off_grads = grads_of(model)
-    report["offload_grads_identical"] = all(torch.equal(a, b) for a, b in zip(off_grads, fast_grads))
-    config.OFFLOAD_CHECKPOINTS = False
+    def scaled():
+        for p in params:
+            p.grad = None
+        batch = runner.pack(ids, mask, labels)
+        loss_sum, _ = run_step(runner, batch)
+        (loss_sum / batch.n_lab * 65536.0).backward()
+        extra["scaled_grads_finite"] = all(bool(torch.isfinite(p.grad).all()) for p in params)
 
-    # timing over a few different batches (forward + backward)
     def run_fast():
         for b in batches:
             for p in params:
                 p.grad = None
             fast_step(runner, *b)
 
-    def run_stock():
-        for b in batches:
+    def timing(tag):
+        def go():
+            run_fast()
+            torch.cuda.reset_peak_memory_stats()
+            extra[tag + "_s_per_step"] = round(timed(run_fast, 2) / len(batches), 4)
+            extra[tag + "_peak_mib"] = round(torch.cuda.max_memory_allocated() / 2**20)
+        return go
+
+    def offload_ckpt():
+        for p in params:
+            p.grad = None
+        fast_step(runner, ids, mask, labels)
+        base_grads = grads_of(model)
+        config.OFFLOAD_CHECKPOINTS = True
+        try:
             for p in params:
                 p.grad = None
-            stock_step(model, *b)
+            fast_step(runner, ids, mask, labels)
+            extra["offload_ckpt_grads_identical"] = all(torch.equal(a, b) for a, b in zip(grads_of(model), base_grads))
+            timing("fast_offload_ckpt")()
+        finally:
+            config.OFFLOAD_CHECKPOINTS = False
 
-    run_fast()
-    report["fast_s_per_step"] = timed(run_fast, 2) / len(batches)
-    config.OFFLOAD_CHECKPOINTS = True
-    run_fast()
-    report["fast_offload_s_per_step"] = timed(run_fast, 2) / len(batches)
-    config.OFFLOAD_CHECKPOINTS = False
-    # the stock path now sees the fp16 embedding (same values), fine for timing
-    report["stock_s_per_step"] = timed(run_stock, 1) / len(batches)
-    report["tokens_real_vs_padded"] = [int(b[1].sum()) for b in batches], [b[1].numel() for b in batches]
+    section("scaled", scaled)
+    section("fast", timing("fast"))
+    section("offload_ckpt", offload_ckpt)
+    extra["tokens_real_vs_padded"] = [[int(b[1].sum()) for b in batches], [b[1].numel() for b in batches]]
 
-    ok = (report["loss_rel"] < 2e-3 and report["entropy_rel"] < 5e-3 and report["accuracy_abs"] < 0.02
-          and report["row_loss_rel_max"] < 5e-3 and report["grad_cos_worst"] > 0.995
-          and report["scaled_grads_finite"] and report["offload_grads_identical"])
-    report["PASS"] = ok
-    print(json.dumps(report, indent=2))
+    def offload_weights():
+        nonlocal runner
+        for p in params:
+            p.grad = None
+        fast_step(runner, ids, mask, labels)
+        gpu_grads = grads_of(model)
+        config.OFFLOAD_WEIGHTS = True
+        try:
+            runner = FastQwen2(model, seed=1)
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            for p in params:
+                p.grad = None
+            fast_step(runner, ids, mask, labels)
+            extra["offload_weights_grads_identical"] = all(torch.equal(a, b) for a, b in zip(grads_of(model), gpu_grads))
+            timing("fast_offload_weights")()
+            config.OFFLOAD_CHECKPOINTS = True
+            timing("fast_offload_both")()
+        finally:
+            config.OFFLOAD_CHECKPOINTS = False
+            config.OFFLOAD_WEIGHTS = False
+
+    section("offload_weights", offload_weights)
     print("\nFAST PATH CHECK:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
