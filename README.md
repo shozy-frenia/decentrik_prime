@@ -38,8 +38,8 @@ step does this:
 | Logits `[4, T, 151936]` materialised many times: fp16 GEMM out, accelerate's fp32 copy, the loss' fp32 upcast, log-softmax for backward, TRL's entropy chunks, the argmax for accuracy, rewind's per-row CE | several GB + ~10 % of time in memory-bound passes | **fused LM head**: logits only for 256 tokens at a time, one Triton pass gives loss, entropy, argmax-accuracy, per-row loss and the logit gradient; d(hidden) is computed in the forward |
 | Tied embedding/`lm_head` upcast to fp32 (934 MB) by `prepare_model_for_kbit_training`, re-cast to fp16 by autocast for every `lm_head` call | 934 MB + 467 MB transient + time | **kept fp16** — bit-exact: on a T4 Soup loads the checkpoint as fp16, so the fp32 copy only ever holds fp16 values |
 | fp32 residual stream with ~10 small elementwise kernels per norm, RoPE via `cat`/`rotate_half`, LoRA dropout in fp32, PEFT's `result.clone()`, SwiGLU in fp32 | ~44 % of GPU time | **fused kernels**: residual+RMSNorm+both dropout masks; LoRA-add+RoPE; SwiGLU on a fused buffer |
-| bitsandbytes dequantises each of the 7 weights of a layer separately (and again in backward) | ~5 % | **one kernel per layer** dequantises all 7 weights, bit-exactly, straight into fused **Q\|K\|V** and **gate\|up** buffers, so 7 GEMMs become 4 |
-| SDPA (memory-efficient) on padded, `repeat_kv`-expanded heads with an explicit padding mask | ~5 % | kept: PyTorch's SDPA on a zero-padded view of the packed batch (right padding needs only the causal mask). Our own varlen causal GQA flash attention in Triton is implemented and tested correct but was ~40× slower than expected on sm_75 (see *What did not work*), so it is off by default |
+| bitsandbytes dequantises each of the 7 weights of a layer separately (and again in backward) | ~5 % | **one kernel per layer half** dequantises the weights, bit-exactly, straight into fused **Q\|K\|V** and **gate\|up** buffers, so 7 GEMMs become 4; the next layer's half is dequantised **on a side stream under the current layer's GEMMs**, and the layer at each forward↔backward turn is reused (54 instead of 56 layer dequants per step) |
+| SDPA (memory-efficient) on padded, `repeat_kv`-expanded heads with an explicit padding mask | ~5 % | the same tensor-core kernel (PyTorch's memory-efficient attention, what SDPA runs on a T4) called **varlen on the packed tokens with `cu_seqlens`**: no padding, no mask, no scatter/gather. Checked against padded SDPA at start-up (falls back on any mismatch). Our own Triton flash attention is in `k_attn.py` but cannot use tensor cores on sm_75 (see *What did not work*) |
 
 What stays exactly as in the base, by construction: the dequantised fp16 weights are
 bit-identical to bitsandbytes'; the residual stream is fp32; every GEMM is an fp16 cuBLAS GEMM
@@ -53,7 +53,7 @@ untouched.
 
 | Kernel (`@triton.jit`) | File | Replaces | How it works |
 |---|---|---|---|
-| `nf4_layer_dequant_kernel` | `k_nf4.py` | 7× bitsandbytes `dequantize_4bit` per layer per pass | At setup the 7 NF4 weights of a layer are repacked into one buffer `[nibbles \| absmax codes \| 2nd-level scales \| offsets]` (bitsandbytes' own tensors are re-pointed at views of it, nothing is stored twice). One launch per layer decodes `fp16(NF4[nibble] · (code2[q]·absmax2 + offset))` for 8192 weights per program (`tl.join` interleaves the two nibbles of a byte), writing the fused Q\|K\|V, O, gate\|up, down matrices. Launched with FMA fusion off: bit-exact vs bitsandbytes. |
+| `nf4_layer_dequant_kernel` | `k_nf4.py` | 7× bitsandbytes `dequantize_4bit` per layer per pass | At setup the 7 NF4 weights of a layer are repacked into one buffer `[nibbles \| absmax codes \| 2nd-level scales \| offsets]` (bitsandbytes' own tensors are re-pointed at views of it, nothing is stored twice). One launch per layer half (attention part, MLP part) decodes `fp16(NF4[nibble] · (code2[q]·absmax2 + offset))` for 8192 weights per program (`tl.join` interleaves the two nibbles of a byte), writing the fused Q\|K\|V, O, gate\|up, down matrices. Launched with FMA fusion off: bit-exact vs bitsandbytes. |
 | `rms_fwd_kernel` | `k_norm.py` | Qwen2RMSNorm (fp32, ~6 kernels) + residual add + PEFT's two `lora_dropout` + autocast casts | One program per token: `x = x_prev + delta`, `rstd`, `y = w·(x·rstd)`, writes the fp32 residual (the layer checkpoint), fp16 `y` for the GEMMs and both dropout-masked LoRA inputs. Masks come from Philox (`tl.rand`) keyed by token×column, so backward regenerates them instead of storing them. |
 | `rms_bwd_kernel` | `k_norm.py` | autograd of the above + dropout backward + residual-grad accumulation | `dx = rstd·(g − x̂·mean(g·x̂))`, `g = w·(dy + mask_q·dLoRA_q + mask_v·dLoRA_v)`, accumulated in place into the fp32 residual gradient. |
 | `qkv_epilogue_fwd_kernel` | `k_rope.py` | PEFT's LoRA add for q/v, `apply_rotary_pos_emb` (`rotate_half`, `cat`), the fp16 casts for SDPA | In place on the fused QKV GEMM output: `q += 2·lora_q`, rotate q and k with the model's cos/sin, `v += 2·lora_v`. |
@@ -72,9 +72,10 @@ untouched.
   dequantised weights, our kernels for everything else), so at most one layer's activations are
   alive. LoRA gradients follow autocast's fp16 GEMM semantics and land in the fp32 `.grad`.
 * **Compute order per layer**: dequant (1 launch) → norm+dropout → LoRA-A GEMMs → fused QKV GEMM
-  (bias via `addmm`, as bitsandbytes does) → LoRA-B GEMMs → QKV epilogue → attention (SDPA; in the
-  backward recompute it records a small local autograd graph that is differentiated with
-  `torch.autograd.grad`) → O GEMM →
+  (bias via `addmm`, as bitsandbytes does) → LoRA-B GEMMs → QKV epilogue → attention
+  (`aten::_efficient_attention_forward/backward` with `cu_seqlens`, causal per packed row; Q is a
+  strided view of the QKV buffer, K/V expanded to 12 heads, and our epilogue backward sums the 6
+  per-head dK/dV partials) → O GEMM →
   residual+norm → fused gate|up GEMM → gated SiLU → down GEMM.
 * **Trainer side** (`solution/integration.py`): the trainer's `compute_loss` is replaced on the
   instance. It packs the batch, runs the step and records exactly what HF `Trainer`, TRL's
@@ -95,6 +96,9 @@ untouched.
   streamed copy, RMSNorm vs fp64 autograd incl. both LoRA branches and mask regeneration, RoPE vs
   HF's formula with autograd, attention vs SDPA per sequence with autograd, gated SiLU, the head
   vs `cross_entropy`/`log_softmax`/`argmax`).
+* `dev/test_ws_schedule.py` (CPU): the dequantisation schedule driven through a model of CUDA
+  streams and events: every GEMM reads the expected layer, no dequant overwrites weights that a
+  queued GEMM still reads (a mutated schedule is caught).
 * `dev/check_fast_path.py` (`dev/kaggle_dev_check.ipynb`): the fast step vs the stock
   transformers+PEFT+bitsandbytes step on the real model and real rows (LoRA-B randomised so all
   112 gradients are non-zero): loss, entropy, accuracy, rewind row losses, gradient cosine and
@@ -111,7 +115,7 @@ untouched.
 
 | Rule | How |
 |---|---|
-| Own Triton kernels run and take ≥ 5 % | 12 kernels in `solution/`, all launched every step (dequant, norms, attention, MLP, head) |
+| Own Triton kernels run and take ≥ 5 % | 8 kernels launched every step (dequant, norms, QKV epilogue, MLP, head); the 4 Triton attention kernels in `k_attn.py` are off by default |
 | No ready-made kernel libraries | only torch, triton, transformers, peft, trl, bitsandbytes, soup-cli; no imports of the banned list |
 | Same task | model, data, batch order (the trainer's sampler/collator are untouched), steps, LoRA r/alpha/dropout/targets, optimizer, schedule, loss; no Soup switch changed (`gradient_checkpointing`, `packing`, `use_liger`, ...): recomputation and padding removal are our own code |
 | Same Soup outputs | the metrics and rewind records are computed as TRL/Soup do (see above) |
@@ -148,17 +152,20 @@ checkpoints / 4-bit weights, background compilation).
 * LoRA dropout masks are not bit-identical to PyTorch's stream, so the loss curve is not
   bit-identical to the base after step 1 (it is a different, equally valid dropout draw).
 * Recomputation costs one extra forward of the Q|K|V, O and gate|up GEMMs (~35 % more GEMM FLOPs);
-  we trade it for the memory win. GEMMs remain cuBLAS on dequantised fp16 weights; a fused NF4
-  GEMM was not attempted.
+  we trade it for the memory win. GEMMs remain cuBLAS on dequantised fp16 weights: a fused NF4
+  GEMM in Triton would run on FMA units on this GPU (next point).
 * The load phase (transformers quantising on the GPU) sets a floor of ~1.5 GB for the peak:
   streaming the weights from host memory only pays off below that floor.
 * **Our Triton flash attention on the T4.** `k_attn.py` (varlen, causal, GQA without K/V copies,
   FlashAttention-2 schedule) passes all correctness tests, but in the first measured run it took
-  ~0.9 s of a 1.14 s step (forward ~10 ms per call where ~0.3 ms was expected) and compiled for
-  3.6–6.8 s per kernel: Triton 3.6's sm_75 path (MMA m16n8k8, no cp.async, 64 KB shared memory) did
-  not handle our 64×128 / 32×128 tiles well. The same run showed everything else of the step at
-  ~0.23 s. We switched attention to PyTorch's SDPA (the kernel base Soup uses) on a padded view;
-  the kernels stay in the repository behind `ATTN_IMPL = "triton"`.
+  ~0.9 s of a 1.14 s step (forward ~10 ms per call where ~0.3 ms was expected). The reason is in
+  Triton itself: in Triton 3.6 `AccelerateMatmul` only maps `tl.dot` to tensor cores (MMA) for
+  compute capability ≥ 8.0; for sm_75 it emits *"Dot op using MMA for compute capability 75 has
+  been deprecated. It falls back to the FMA path"*, so every `tl.dot` runs on the fp32 FMA units
+  (8 TFLOP/s peak instead of 65). No tile choice fixes that, and it rules out Triton GEMMs of any
+  kind on this GPU (fused NF4 GEMM, a Triton LM head). Our kernels therefore do the memory-bound
+  work, and every matmul stays on tensor cores: cuBLAS for the GEMMs, PyTorch's memory-efficient
+  attention kernel for attention (`dev/bench_kernels.py` prints the PTX check).
 
 ## Sources and credits
 
