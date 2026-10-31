@@ -23,6 +23,21 @@ class _FakeLinear:
         self.weight = weight
 
 
+def _qs_to(state, device):
+    """A copy of a bitsandbytes QuantState on `device` (QuantState.to works in place)."""
+    import copy
+
+    qs = copy.copy(state)
+    qs.code = state.code.to(device)
+    qs.absmax = state.absmax.to(device)
+    if getattr(state, "nested", False):
+        qs.offset = state.offset.to(device)
+        qs.state2 = copy.copy(state.state2)
+        qs.state2.absmax = state.state2.absmax.to(device)
+        qs.state2.code = state.state2.code.to(device)
+    return qs
+
+
 def test_nf4_layer_dequant_is_bit_exact():
     bnb = pytest.importorskip("bitsandbytes")
     from bitsandbytes.nn import Params4bit
@@ -67,19 +82,57 @@ def test_nf4_layer_dequant_is_bit_exact():
     assert torch.equal(out3, out), "split dequant differs from the whole-layer dequant"
     with pytest.raises(ValueError):
         dequant_range(packed, 256, packed.n_qblocks, code2, nf4, out3)
-    # the same layer kept in pinned host memory and streamed through the two GPU slots
-    from solution.k_nf4 import WeightStreamer, dequant_tensors
+    # v6: layers kept in pinned host memory and streamed through the weight pipe's two GPU slots
+    # (layer j -> slot j % 2), dequantised from the slot on a side stream; three different layers
+    # walked forward and back like the training step does, with one layer resident on the GPU
+    from solution.k_nf4 import WeightPipe
 
     host_layer, code2h = repack_layer(linears, torch.device(DEV), host=True)
     assert not host_layer.flat.is_cuda and host_layer.flat.is_pinned()
-    streamer = WeightStreamer([host_layer, packed], torch.device(DEV))
-    for i in (0, 1, 1, 0):
-        out2 = torch.zeros_like(out)
-        pk, qa, s2, o2 = streamer.acquire(i)
-        dequant_tensors(pk, qa, s2, o2, host_layer.n_qblocks, code2h, nf4, out2)
-        streamer.release()
-        streamer.prefetch(1 - i)
-        assert torch.equal(out2, out), f"streamed layer {i} differs"
+    assert torch.equal(code2h, code2)
+    for name in LAYER_WEIGHTS:          # bitsandbytes' tensors now point into the pinned buffer
+        p = linears[name].weight
+        assert not p.data.is_cuda
+        assert torch.equal(bnb.functional.dequantize_4bit(p.data.to(DEV), _qs_to(p.quant_state, DEV)).half(),
+                           refs[name])
+    others = []
+    for seed in (1, 2):
+        torch.manual_seed(seed)
+        lin = {}
+        for name in LAYER_WEIGHTS:
+            w = (torch.randn(shapes[name]) * 0.05).half()
+            lin[name] = _FakeLinear(Params4bit(w, requires_grad=False, quant_type="nf4",
+                                               compress_statistics=True, blocksize=64).to(DEV))
+        others.append(lin)
+    ref_b = torch.empty_like(out)
+    pk_b, _ = repack_layer(others[0], torch.device(DEV))
+    dequant_layer(pk_b, code2, nf4, ref_b)
+    ref_c = torch.empty_like(out)
+    pk_c, _ = repack_layer(others[1], torch.device(DEV))
+    dequant_layer(pk_c, code2, nf4, ref_c)
+    host_b, _ = repack_layer(others[0], torch.device(DEV), host=True)
+    host_c, _ = repack_layer(others[1], torch.device(DEV), host=True)
+    expect = [out, ref_b, ref_c]
+    side = torch.cuda.Stream()
+    for resident, layers in (((), [host_layer, host_b, host_c]), ((1,), [host_layer, pk_b, host_c])):
+        pipe = WeightPipe(layers, torch.device(DEV), side=side, resident=resident)
+        pipe.prefetch(0)
+        pipe.prefetch(1)
+        walk = [0, 1, 2, 2, 1, 0, 0, 1, 2]
+        for step, j in enumerate(walk):
+            got = torch.full_like(out, float("nan"))
+            side.wait_stream(torch.cuda.current_stream())
+            src = pipe.acquire(j, side)
+            with torch.cuda.stream(side):
+                dequant_range(src, 0, split, code2, nf4, got)
+                dequant_range(src, split, src.n_qblocks, code2, nf4, got)
+            torch.cuda.current_stream().wait_stream(side)
+            ahead = walk[step + 2] if step + 2 < len(walk) else None
+            if ahead is not None and ahead != j:
+                pipe.prefetch(ahead)
+            assert torch.equal(got, expect[j]), f"streamed layer {j} differs (resident={resident})"
+        n_streamed = sum(1 for j in walk if j not in resident)
+        assert pipe.copies <= n_streamed, (pipe.copies, n_streamed)
 
 
 # ------------------------------------------------------------------ RMSNorm
@@ -333,3 +386,83 @@ def test_head_rows_stats_and_grad():
     grad = (logp.exp() - torch.nn.functional.one_hot(tgt.long().clamp(min=0), vocab).float()) * 1024.0
     _close(work[valid], grad[valid].half(), 2e-2, 3e-3, "grad")
     assert torch.equal(work[~valid], logits[~valid])
+
+
+# ------------------------------------------------------------------ LM head over vocabulary chunks (v6)
+def test_fp32_accumulating_gemm():
+    """acc (fp32) += a16 @ b16 in place, through torch's addmm with an fp32 out_dtype."""
+    from solution import k_head
+
+    torch.manual_seed(8)
+    a = torch.randn(77, 4096, device=DEV).half()
+    b = (torch.randn(4096, 1536, device=DEV) * 0.1).half()
+    acc = torch.randn(77, 1536, device=DEV)
+    ref = acc.double() + a.double() @ b.double()
+    k_head._accumulate(acc, a, b)
+    assert acc.dtype == torch.float32
+    _close(acc, ref, 2e-3, 1e-4, "fp32-accumulated GEMM")
+    assert k_head._ACC_OK[0], "torch.addmm(out_dtype=float32) unavailable: fell back to an fp16 product"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_streamed_head_matches_torch_and_v5(stream):
+    """The v6 head (vocabulary chunks, online softmax, gradient accumulated in the pass), with the
+    embedding on the GPU or streamed from pinned host memory, against fp64 torch math on the same
+    fp16 logits and against the v5 head."""
+    from solution.k_head import EmbeddingStream, ResidentEmbedding, fused_head, streamed_head
+
+    torch.manual_seed(7)
+    V, D, n = 151936, 1536, 300
+    emb = (torch.randn(V, D, device=DEV) * 0.02).half()
+    yf = (torch.randn(n, D, device=DEV) * 2.0).half()
+    tgt = torch.randint(0, V, (n,), device=DEV)
+    tgt[torch.randperm(n, device=DEV)[:90]] = -1
+    tgt[7] = int((yf[7].float() @ emb.float().t()).argmax())        # a hit
+    valid = tgt >= 0
+    perm = torch.cat([valid.nonzero().flatten(), (~valid).nonzero().flatten()])
+    inv = torch.empty_like(perm)
+    inv[perm] = torch.arange(n, device=DEV)
+    tgt_sorted = tgt[perm].int()
+    n_lab = int(valid.sum())
+    e_target = emb.index_select(0, tgt_sorted[:n_lab])
+    dummy = torch.zeros(16, device=DEV)
+    if stream:
+        src = EmbeddingStream(emb.cpu().pin_memory(), 4096, 3, torch.device(DEV))
+        src.start()
+        rows = src.rows(None, tgt_sorted[:n_lab].cpu().long())
+        assert torch.equal(rows, e_target)
+    else:
+        src = ResidentEmbedding(emb, 4096)
+    loss, stats, dy = streamed_head(yf, src, tgt_sorted, perm.int(), n_lab, e_target, 1024.0, dummy)
+    if stream:
+        assert src.copies == src.n_chunks, (src.copies, src.n_chunks)
+    logits = (yf @ emb.t()).float()                  # fp16 GEMM output, as the base computes it
+    ys = logits[perm].double()
+    lse = torch.logsumexp(ys, -1)
+    logp = torch.log_softmax(ys, -1)
+    ent = -(logp.exp() * logp).sum(-1)
+    t = tgt_sorted.long()
+    ok = t >= 0
+    xt = ys.gather(1, t.clamp(min=0)[:, None])[:, 0]
+    ce = torch.where(ok, lse - xt, torch.zeros_like(lse))
+    _close(stats[:, 0], ce, 2e-4, 1e-5, "loss")
+    _close(stats[:, 1], ent, 3e-4, 1e-4, "entropy")
+    assert torch.equal(stats[:, 2] > 0.5, (ys.argmax(-1) == t) & ok)
+    assert bool(stats[:, 2].sum() >= 1)
+    _close(stats[:, 3], lse, 2e-4, 1e-6, "lse")
+    assert abs(float(loss) - float(ce.sum())) <= 1e-4 * float(ce.sum())
+    g = logp.exp()
+    g[ok, t[ok]] -= 1.0
+    g[~ok] = 0.0
+    ref = torch.zeros(n, D, dtype=torch.float32, device=DEV)
+    ref[perm] = (g.float() @ emb.float()) * 1024.0
+    _close(dy, ref, 3e-2, 5e-3, "d(hidden)")
+    l5, s5, d5 = fused_head(yf, emb, tgt_sorted, perm.int(), inv.int(), n_lab, 256, 1024.0)
+    _close(stats, s5, 3e-4, 1e-4, "stats vs the v5 head")
+    _close(dy, d5, 5e-2, 1e-2, "d(hidden) vs the v5 head")
+    # a second pass through the same ring (the next step) gives the same result
+    if stream:
+        src.start()
+        loss2, stats2, dy2 = streamed_head(yf, src, tgt_sorted, perm.int(), n_lab, e_target, 1024.0, dummy)
+        _close(stats2, stats, 1e-6, 1e-6, "second step: stats")
+        _close(dy2, dy, 1e-3, 1e-3, "second step: d(hidden)")

@@ -18,8 +18,38 @@ ATTN_IMPL = "varlen"
 # Dequantise the next layer's weights on a side stream while the current layer's GEMMs run.
 DEQUANT_OVERLAP = True
 
-# Tokens per chunk of the fused LM head (logits are only ever materialised for this many rows:
-# CHUNK x 151936 x 2 bytes, 78 MB at 256).
+# ---------------------------------------------------------------------------- where things live
+# v6: by default nothing of the model stays on the GPU between uses. Each of these falls back to
+# the v5 placement (GPU-resident) if its pinned host buffer cannot be allocated.
+#
+# Keep the repacked 4-bit weights (680 MB) in pinned host memory; layer j is copied into GPU slot
+# j % 2 two layers ahead of its dequantisation (forward and backward), on its own copy stream.
+OFFLOAD_WEIGHTS = True
+# ... except for the first RESIDENT_LAYERS layers, which stay on the GPU (24 MB each). The backward
+# moves both weights and saved activations host -> GPU; resident layers take PCIe load off it.
+RESIDENT_LAYERS = 0
+#
+# Keep the tied fp16 embedding / lm_head (467 MB) in pinned host memory. The input embedding is
+# gathered on the CPU (N rows); the LM head streams the matrix through HEAD_RING GPU buffers of
+# HEAD_VOCAB_CHUNK rows each (k_head.streamed_head).
+OFFLOAD_EMBEDDING = True
+#
+# Keep the per-layer fp32 residual checkpoints (6 KB/token/layer) in a pinned host arena too.
+OFFLOAD_CHECKPOINTS = True
+#
+# While the fast path's model is loaded (inside Soup's model setup): skip transformers'
+# caching-allocator warm-up (it reserves the whole model size on the GPU up front), materialise the
+# embedding on the CPU, and move every 4-bit weight to host memory right after bitsandbytes has
+# quantised it on the GPU. The quantisation itself is bitsandbytes' own, on the GPU, as in the base.
+LOAD_TO_HOST = True
+
+# ---------------------------------------------------------------------------- LM head
+# "chunks" = v6 streamed one-pass head over vocabulary chunks (works with a resident embedding
+#            too); "rows" = v5 head (token chunks against the whole vocabulary, embedding on GPU).
+HEAD_IMPL = "chunks"
+HEAD_VOCAB_CHUNK = 4096     # embedding rows per chunk (12.6 MB fp16); every width is a multiple of 16
+HEAD_RING = 3               # GPU buffers the streamed embedding cycles through
+# v5 head: tokens per chunk (logits are materialised for this many rows: CHUNK x 151936 x 2 bytes).
 HEAD_CHUNK = 256
 
 # Scale applied to the fp16 head gradient (p - onehot) before the fp16 GEMM; undone in fp32.
@@ -38,13 +68,22 @@ SAVE_GU = True
 SAVE_ATTN = True
 HOST_CAPACITY = 2048
 
-# Keep the per-layer fp32 residual checkpoints (6 KB/token/layer) in a pinned host arena too,
-# instead of on the GPU.
-OFFLOAD_CHECKPOINTS = False
+# Allocate the pinned host buffers (weights, embedding, activation arenas) in a background thread
+# as soon as apply() runs.
+EARLY_PINNED = True
 
-# Keep the repacked 4-bit weights (680 MB) in pinned host memory and stream each layer into one of
-# two GPU slots one layer ahead (H2D on a side stream, overlapped with the previous layer's work).
-OFFLOAD_WEIGHTS = False
+# Before training (in the background build, while Soup builds the trainer): run the LM head
+# against an fp32 reference on a few random rows and one forward + backward of a small synthetic
+# batch through every kernel and copy path (fast_qwen.FastQwen2.self_test). If the streamed
+# placement fails it (an exception, a mismatch, a non-finite value), the run continues with the
+# v5 placement (FALLBACK_RESIDENT), which is tested the same way; if that fails too, with stock
+# Soup. Nothing of the self-test reaches the training state.
+SELF_TEST = True
+FALLBACK_RESIDENT = True
+
+# Record the step's metrics (loss, entropy, accuracy, rewind row losses) after the backward has
+# been queued instead of synchronising on them between the forward and the backward.
+DEFER_METRICS = True
 
 # Compile every Triton kernel in background threads as soon as apply() runs, so compilation
 # overlaps Soup's imports, data preparation and model loading.

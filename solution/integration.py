@@ -1,13 +1,21 @@
 """How the fast path plugs into Soup 0.77.0 / TRL 0.29.1 / transformers 5.16.1.
 
-1. peft.prepare_model_for_kbit_training (looked up by Soup at call time): when the run is one the
+1. Model loading (transformers' core_model_loading, looked up by name at call time), only while
+   Soup loads the model of a run the fast path implements (the _PLAN context variable is set
+   around Soup's _setup_transformers): transformers' caching-allocator warm-up is skipped (it
+   reserves the size of the whole model on the GPU before loading), the embedding is
+   materialised on the CPU instead of the GPU, and every 4-bit weight is moved to host memory
+   right after bitsandbytes has quantised it on the GPU (the quantisation itself is unchanged:
+   bitsandbytes' own kernel on the GPU, as in the base run). The GPU never holds the model.
+2. peft.prepare_model_for_kbit_training (looked up by Soup at call time): when the run is one the
    fast path implements, the tied embedding is hidden from its fp16 -> fp32 upcast, so it stays
-   fp16 (467 MB instead of 934 MB, and no 1.4 GB load-time spike). This is bit-exact: on a T4 Soup
-   loads the checkpoint in fp16, so the fp32 copy only ever held fp16 values, and the lm_head
-   matmul runs in fp16 under autocast either way.
-2. SFTTrainerWrapper._setup_transformers: after Soup built the 4-bit PEFT model, FastQwen2 checks
-   it (anything unexpected -> stock path), repacks the 4-bit weights and prepares the tables.
-3. SFTTrainerWrapper.train: before training starts, the trainer's compute_loss is replaced on the
+   fp16 (467 MB instead of 934 MB). This is bit-exact: on a T4 Soup loads the checkpoint in fp16,
+   so the fp32 copy only ever held fp16 values, and the lm_head matmul runs in fp16 under
+   autocast either way.
+3. SFTTrainerWrapper._setup_transformers: after Soup built the 4-bit PEFT model, FastQwen2 checks
+   it (anything unexpected -> stock path, with everything moved back to the GPU), repacks the
+   4-bit weights into pinned host memory and prepares the tables.
+4. SFTTrainerWrapper.train: before training starts, the trainer's compute_loss is replaced on the
    instance by `fast_compute_loss`, which runs the fused step and records exactly what the stock
    chain (HF Trainer.compute_loss -> TRL SFTTrainer.compute_loss -> Soup's RewindTrainer) records:
      loss          = summed token CE / num_items_in_batch (HF's ForCausalLMLoss with num_items)
@@ -15,6 +23,9 @@
      num_tokens    = running sum of attention_mask (TRL)
      mean_token_accuracy = argmax hits / supervised tokens (TRL)
      rewind record = per-row mean CE and token counts, popped from the sampler FIFO (Soup)
+   The per-token statistics come back to the host with an asynchronous copy and are recorded at
+   the end of the step's backward (and in any case before the trainer logs), so the CPU never
+   waits between the forward and the backward.
    Anything it does not handle (eval, return_outputs, extra input keys, other loss settings)
    goes to the original method.
 Every patch is narrow and guarded: Soup's regression tests call these methods with fake
@@ -31,6 +42,8 @@ from . import config
 
 _PLAN = contextvars.ContextVar("soup_fast_plan", default=None)
 _STATE = {"installed": False}
+_LOAD = {"host_weights": 0, "host_bytes": 0, "embedding_cpu": False, "warmup_skipped": False,
+         "error": None, "disabled": False}
 
 
 def _process_age():
@@ -86,13 +99,95 @@ def _plan_for(wrapper, cfg, tcfg):
             getattr(tcfg, "freeze_ratio", None) is None,
             getattr(tcfg, "quantization_aware", None) in (None, False, "none"),
             getattr(cfg.data, "format", None) != "raft",
+            getattr(tcfg, "rope_scaling_type", None) in (None, False, "none"),
+            not getattr(tcfg, "relora_steps", None),
         ]
         return all(checks)
     except Exception:  # noqa: BLE001 - fakes in tests or unknown configs: stock path
         return False
 
 
+def _host_load():
+    """The model being loaded right now is the fast path's, and it should stay off the GPU."""
+    return bool(config.LOAD_TO_HOST and _PLAN.get() and not _LOAD["disabled"]
+                and (config.OFFLOAD_WEIGHTS or config.OFFLOAD_EMBEDDING))
+
+
 # --------------------------------------------------------------------------- patches
+def _is_embedding_key(name):
+    return isinstance(name, str) and (name.endswith("embed_tokens.weight") or name == "lm_head.weight")
+
+
+def _weight_to_host(model, target_name):
+    """After transformers set `target_name`: if it is a 4-bit weight bitsandbytes has just
+    quantised on the GPU, move its packed data and quantisation state to host memory."""
+    module_path, _, pname = target_name.rpartition(".")
+    if pname != "weight":
+        return
+    mod = model.get_submodule(module_path) if module_path else model
+    w = getattr(mod, "weight", None)
+    if type(w).__name__ != "Params4bit" or not getattr(w, "bnb_quantized", False) or not w.is_cuda:
+        return
+    w.data = w.data.to("cpu")
+    qs = getattr(w, "quant_state", None)
+    if qs is not None:
+        qs.to("cpu")
+    _LOAD["host_weights"] += 1
+    _LOAD["host_bytes"] += int(w.data.numel() * w.data.element_size())
+
+
+def _patch_loading():
+    try:
+        from transformers import core_model_loading as cml
+        from transformers import modeling_utils as mu
+    except Exception:  # noqa: BLE001 - another transformers layout: load as usual
+        return
+    if getattr(getattr(cml, "set_param_for_module", None), "_soup_fast", False):
+        return
+    orig_get_device = getattr(cml, "get_device", None)
+    orig_set = getattr(cml, "set_param_for_module", None)
+    orig_warm = getattr(mu, "caching_allocator_warmup", None)
+    if orig_get_device is None or orig_set is None:
+        return
+
+    @functools.wraps(orig_get_device)
+    def get_device(device_map, param_name, *args, **kwargs):
+        device = orig_get_device(device_map, param_name, *args, **kwargs)
+        try:
+            if config.OFFLOAD_EMBEDDING and _host_load() and _is_embedding_key(param_name) \
+                    and device != "disk":
+                _LOAD["embedding_cpu"] = True
+                return "cpu"
+        except Exception:  # noqa: BLE001
+            pass
+        return device
+
+    @functools.wraps(orig_set)
+    def set_param_for_module(model, target_name, *args, **kwargs):
+        result = orig_set(model, target_name, *args, **kwargs)
+        if config.OFFLOAD_WEIGHTS and _host_load():
+            try:
+                _weight_to_host(model, target_name)
+            except Exception as exc:  # noqa: BLE001 - leave it where it is; FastQwen2 copes
+                _LOAD["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    get_device._soup_fast = True
+    set_param_for_module._soup_fast = True
+    cml.get_device = get_device
+    cml.set_param_for_module = set_param_for_module
+    if orig_warm is not None:
+        @functools.wraps(orig_warm)
+        def caching_allocator_warmup(*args, **kwargs):
+            if _host_load():
+                _LOAD["warmup_skipped"] = True
+                return None
+            return orig_warm(*args, **kwargs)
+
+        caching_allocator_warmup._soup_fast = True
+        mu.caching_allocator_warmup = caching_allocator_warmup
+
+
 def _patch_prepare_kbit():
     import peft
 
@@ -112,7 +207,7 @@ def _patch_prepare_kbit():
                 emb = model.get_input_embeddings().weight
                 head = model.get_output_embeddings()
                 tied = head is not None and head.weight is emb
-                if tied and emb.dtype == torch.float16 and emb.is_cuda:
+                if tied and emb.dtype == torch.float16 and emb.device.type in ("cuda", "cpu"):
                     hidden = (emb, emb.data)
                     emb.data = torch.empty(0, dtype=torch.float32, device=emb.device)
         except Exception:  # noqa: BLE001
@@ -122,7 +217,7 @@ def _patch_prepare_kbit():
         finally:
             if hidden is not None:
                 hidden[0].data = hidden[1]
-                _log("tied embedding kept in fp16 (bit-exact)")
+                _log(f"tied embedding kept in fp16 (bit-exact), on {hidden[1].device.type}")
 
     prepare_model_for_kbit_training._soup_fast = True
     peft.prepare_model_for_kbit_training = prepare_model_for_kbit_training
@@ -143,12 +238,33 @@ def _patch_wrapper():
             _log("model setup starts (tokenizer, 4-bit load, PEFT)")
         token = _PLAN.set(plan)
         try:
-            result = orig_setup(self, cfg, tcfg)
+            try:
+                result = orig_setup(self, cfg, tcfg)
+            except Exception as exc:  # noqa: BLE001
+                if not (plan and _host_load()):
+                    raise
+                # the host-loading hooks are the only change to Soup's model setup: run it again
+                # without them (the fast path then starts from a GPU-resident model)
+                _log(f"model setup with the host-loading hooks failed ({type(exc).__name__}: {exc});"
+                     " loading again without them")
+                _LOAD["disabled"] = True
+                self.model = None
+                import gc
+
+                import torch
+
+                gc.collect()
+                torch.cuda.empty_cache()
+                result = orig_setup(self, cfg, tcfg)
+        except BaseException:
+            if plan:
+                _restore_quietly(getattr(self, "model", None))
+            raise
         finally:
             _PLAN.reset(token)
         self._soup_fast = None
         if plan:
-            _log("model loaded")
+            _log("model loaded" + _load_note())
             self._soup_fast = _build_runner(self, cfg, tcfg)
         return result
 
@@ -156,17 +272,25 @@ def _patch_wrapper():
     def train(self, *args, **kwargs):
         runner = getattr(self, "_soup_fast", None)
         trainer = getattr(self, "trainer", None)
-        if runner is not None and trainer is not None:
-            if _install_on_trainer(trainer, runner):
-                from . import precompile
-                precompile.wait()
-            else:
+        if runner is not None:
+            from . import precompile
+            precompile.wait()
+            supported = trainer is not None and _trainer_supported(trainer)
+            if not supported:
+                _log("fast path not installed: trainer settings differ from the task")
+            installed = supported and _runner_ready(runner) and _install_on_trainer(trainer, runner)
+            if not installed:
                 runner.restore_stock()
                 self._soup_fast = None
             _log("training starts")
             try:
                 return orig_train(self, *args, **kwargs)
             finally:
+                if installed:
+                    try:
+                        runner.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
                 _log("training, final save and Soup's wrap-up done")
         return orig_train(self, *args, **kwargs)
 
@@ -176,38 +300,79 @@ def _patch_wrapper():
     cls.train = train
 
 
+def _load_note():
+    parts = []
+    if _LOAD["warmup_skipped"]:
+        parts.append("allocator warm-up skipped")
+    if _LOAD["embedding_cpu"]:
+        parts.append("embedding loaded on the CPU")
+    if _LOAD["host_weights"]:
+        parts.append(f"{_LOAD['host_weights']} 4-bit weights moved to host after quantisation "
+                     f"({_LOAD['host_bytes'] / 2**20:.0f} MiB)")
+    if _LOAD["error"]:
+        parts.append(f"load hook error: {_LOAD['error']}")
+    try:
+        import torch
+
+        parts.append(f"GPU peak so far {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated, "
+                     f"{torch.cuda.max_memory_reserved() / 2**20:.0f} MiB reserved")
+    except Exception:  # noqa: BLE001
+        pass
+    return (": " + "; ".join(parts)) if parts else ""
+
+
+def _restore_quietly(model):
+    if model is None:
+        return
+    try:
+        import torch
+
+        from .fast_qwen import restore_to_gpu
+
+        restore_to_gpu(model, torch.device("cuda", torch.cuda.current_device()))
+    except Exception as exc:  # noqa: BLE001
+        _log(f"could not move the model back to the GPU: {type(exc).__name__}: {exc}")
+
+
 def _build_runner(wrapper, cfg, tcfg):
     import torch
 
     model = getattr(wrapper, "model", None)
     if not isinstance(model, torch.nn.Module) or not hasattr(model, "get_base_model"):
+        _restore_quietly(model)
         return None
     started = time.perf_counter()
     try:
         from .fast_qwen import FastQwen2
 
         seed = getattr(tcfg, "seed", None)
-        runner = FastQwen2(model, seed=0 if seed is None else int(seed))
+        runner = FastQwen2(model, seed=0 if seed is None else int(seed), background=True)
     except Exception as exc:  # noqa: BLE001 - any mismatch: keep the stock path
         _log(f"fast path disabled: {type(exc).__name__}: {exc}")
-        _restore_fp32_embedding(model)
+        _restore_quietly(model)
         return None
-    _log(f"fast path ready in {time.perf_counter() - started:.2f} s "
-         f"(peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated so far); "
-         f"attention: {runner.attn_note}; dequant overlap: {runner.overlap}")
+    runner._t_build = started
+    _log(f"fast path validated in {time.perf_counter() - started:.2f} s; placement and repacking "
+         f"continue in the background while Soup builds the trainer")
     return runner
 
 
-def _restore_fp32_embedding(model):
-    """If the fast path is not used, give the stock path the fp32 embedding it expects."""
-    try:
-        import torch
+def _runner_ready(runner):
+    """Join the background build; False (after putting the model back on the GPU) if it failed."""
+    import torch
 
-        emb = model.get_input_embeddings().weight
-        if emb.dtype == torch.float16:
-            emb.data = emb.data.float()
-    except Exception:  # noqa: BLE001
-        pass
+    try:
+        runner.ready()
+    except Exception as exc:  # noqa: BLE001
+        _log(f"fast path disabled (build failed: {type(exc).__name__}: {exc})")
+        runner.restore_stock()
+        return False
+    _log(f"fast path ready (GPU {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated, peak so far "
+         f"{torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated / "
+         f"{torch.cuda.max_memory_reserved() / 2**20:.0f} MiB reserved); {runner.placement()}; "
+         f"attention: {runner.attn_note}; dequant overlap: {runner.overlap}; "
+         f"self-test: {runner.test_note}")
+    return True
 
 
 # --------------------------------------------------------------------------- trainer
@@ -239,6 +404,19 @@ def _install_on_trainer(trainer, runner):
     trainer._soup_orig_compute_loss = original
     trainer._soup_fast_runner = runner
     trainer.compute_loss = types.MethodType(fast_compute_loss, trainer)
+    # the step's metrics are recorded at the end of its backward; whatever happens, they are in
+    # place before the trainer averages and logs them
+    orig_log = trainer.log
+
+    @functools.wraps(orig_log)
+    def log(*args, **kwargs):
+        try:
+            runner.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        return orig_log(*args, **kwargs)
+
+    trainer.log = log
     _log("fast compute_loss installed")
     return True
 
@@ -246,21 +424,41 @@ def _install_on_trainer(trainer, runner):
 _INPUT_KEYS = {"input_ids", "attention_mask", "labels"}
 
 
+def _record_metrics(trainer, runner, batch, stats_cpu, ready, step):
+    """Append the step's TRL metrics and Soup's rewind record from the per-token stats."""
+    from .fast_qwen import batch_metrics
+
+    try:
+        if ready is not None:
+            ready.synchronize()
+        m = batch_metrics(batch, stats_cpu)
+        metrics = trainer._metrics["train"]
+        metrics["entropy"].append(m["entropy"])
+        metrics["mean_token_accuracy"].append(m["accuracy"])
+        state = getattr(trainer, "_soup_rewind_state", None)
+        if state is not None and not state.failed:
+            try:
+                state.on_micro_batch(step=step, row_loss=m["row_loss"], row_tokens=m["row_tokens"])
+            except Exception as exc:  # noqa: BLE001 - the recorder never raises into training
+                state.fail(exc)
+    except Exception as exc:  # noqa: BLE001
+        _log(f"metrics of step {step} not recorded: {type(exc).__name__}: {exc}")
+
+
 def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
     runner = self._soup_fast_runner
     if (return_outputs or not getattr(model, "training", False) or not self.model.training
             or not set(inputs) <= _INPUT_KEYS | {"_prediction_loss_only"}
             or not _INPUT_KEYS <= set(inputs)):
-        return self._soup_orig_compute_loss(model, inputs, return_outputs=return_outputs,
-                                            num_items_in_batch=num_items_in_batch)
+        return _stock_compute_loss(self, model, inputs, return_outputs, num_items_in_batch)
     import torch
 
-    from .fast_qwen import batch_metrics, run_step
+    from .fast_qwen import run_step
 
+    runner.flush()
     batch = runner.pack(inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
     if batch is None:
-        return self._soup_orig_compute_loss(model, inputs, return_outputs=return_outputs,
-                                            num_items_in_batch=num_items_in_batch)
+        return _stock_compute_loss(self, model, inputs, return_outputs, num_items_in_batch)
     inputs.pop("_prediction_loss_only", None)
     t0 = time.perf_counter()
     loss_sum, stats = run_step(runner, batch)
@@ -275,28 +473,43 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
         loss = loss_sum / max(batch.n_lab, 1)
 
     # TRL SFTTrainer.compute_loss metrics and Soup's rewind record
-    m = batch_metrics(batch, stats.detach().to("cpu"))
-    metrics = self._metrics["train"]
-    metrics["entropy"].append(m["entropy"])
     self._total_train_tokens += int(batch.n_real)
-    metrics["num_tokens"] = [self._total_train_tokens]
-    metrics["mean_token_accuracy"].append(m["accuracy"])
-    state = getattr(self, "_soup_rewind_state", None)
-    if state is not None and not state.failed:
-        try:
-            state.on_micro_batch(step=int(self.state.global_step) + 1, row_loss=m["row_loss"],
-                                 row_tokens=m["row_tokens"])
-        except Exception as exc:  # noqa: BLE001 - the recorder never raises into training
-            state.fail(exc)
+    self._metrics["train"]["num_tokens"] = [self._total_train_tokens]
+    step = int(self.state.global_step) + 1
+    if config.DEFER_METRICS:
+        host = torch.empty(stats.shape, dtype=stats.dtype, pin_memory=True)
+        host.copy_(stats.detach(), non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record()
+        runner.defer(functools.partial(_record_metrics, self, runner, batch, host, ready, step))
+    else:
+        _record_metrics(self, runner, batch, stats.detach().to("cpu"), None, step)
     if runner.steps <= 3:
         _log(f"step {runner.steps}: {batch.B} rows, {batch.n_real} tokens packed of {batch.B * batch.Tm} "
-             f"({batch.n_lab} supervised), forward {time.perf_counter() - t0:.3f} s, "
-             f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, "
-             f"{runner.n_dequant} half-layer dequants so far, kept from forward: "
-             f"{_plan_text(runner)}")
+             f"({batch.n_lab} supervised), forward queued in {time.perf_counter() - t0:.3f} s, "
+             f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB allocated / "
+             f"{torch.cuda.max_memory_reserved() / 2**20:.0f} MiB reserved, "
+             f"{runner.n_dequant} half-layer dequants so far, kept from forward: {_plan_text(runner)}")
         if runner.steps == 1:
             _log(f"host arenas: {runner.host_note}")
     return loss
+
+
+def _stock_compute_loss(trainer, model, inputs, return_outputs, num_items_in_batch):
+    """The original compute_loss. With the model off the GPU the stock forward cannot run, so the
+    fast path is taken down first (everything back on the GPU, the original method reinstalled)."""
+    runner = getattr(trainer, "_soup_fast_runner", None)
+    if runner is not None and (runner.pipe is not None or runner.emb_on_host):
+        _log("a batch the fast path does not handle: switching this run back to the stock path")
+        try:
+            runner.flush()
+        except Exception:  # noqa: BLE001
+            pass
+        runner.restore_stock()
+        trainer.compute_loss = trainer._soup_orig_compute_loss
+        trainer._soup_fast_runner = None
+    return trainer._soup_orig_compute_loss(model, inputs, return_outputs=return_outputs,
+                                           num_items_in_batch=num_items_in_batch)
 
 
 def _plan_text(runner):
@@ -313,6 +526,7 @@ def install():
     if _STATE["installed"]:
         return
     _log("apply()")
+    _patch_loading()
     _patch_prepare_kbit()
     _patch_wrapper()
     _STATE["installed"] = True

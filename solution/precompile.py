@@ -74,17 +74,26 @@ def _join_quietly():
 
 def _weight(kernel):
     name = getattr(getattr(kernel, "fn", None), "__name__", "")
+    # the v5 head is compiled last when it is only the fallback placement's
+    rows = 6 if config.HEAD_IMPL == "rows" else 0
     return {"attn_bwd_dkdv_kernel": 9, "attn_bwd_dq_kernel": 8, "attn_fwd_kernel": 7,
-            "lm_head_rows_kernel": 6, "qkv_epilogue_bwd_kernel": 5}.get(name, 1)
+            "head_chunk_kernel": 6, "lm_head_rows_kernel": rows, "qkv_epilogue_bwd_kernel": 5,
+            "rms_bwd_kernel": 4, "rms_fwd_kernel": 4}.get(name, 1)
 
 
-def wait(timeout=300.0):
+def wait(timeout=300.0, report=True):
+    """Join the compile threads (any thread may call this); the first call with report=True
+    prints the timings and any compile warning."""
     start = time.perf_counter()
     for t in _threads:
         t.join(max(0.0, timeout - (time.perf_counter() - start)))
-    if config.VERBOSE and _threads:
+    if report and config.VERBOSE and _threads and not _reported:
+        _reported.append(True)
         waited = time.perf_counter() - start
         print(f"[solution] precompiled {len(_timing)} kernels (waited {waited:.2f} s): {_timing}",
               file=sys.stderr, flush=True)
         for err in _errors:
             print(f"[solution] precompile warning: {err}", file=sys.stderr, flush=True)
+
+
+_reported = []
