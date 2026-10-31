@@ -879,6 +879,7 @@ class FastQwen2:
         n, D = batch.n, self.D
         dev = self.device
         f16, f32 = torch.float16, torch.float32
+        self._timeline_start(batch)
         self._refresh_lora16()
         if self.overlap:
             self.dq_stream.wait_stream(torch.cuda.current_stream(dev))
@@ -936,6 +937,12 @@ class FastQwen2:
             del op
             self._ws_use("mlp", i)
             self._weights_ahead(i + 2)
+            if config.EARLY_RETIRE:
+                # layer i-1's saved tensors (gate|up above all) leave the GPU before gate|up of
+                # layer i is allocated: its copy was queued right after layer i-1's gate|up GEMM,
+                # i.e. a down GEMM and an attention block ago. One layer of saved activations
+                # less at the forward's peak (~44 MB for 838 tokens).
+                store.retire(i - 1)
             gu = torch.mm(y2, self.W_gu.t())
             act = torch.empty((n, self.I), dtype=f16, device=dev)
             gated_silu_forward(gu, act)
@@ -946,6 +953,7 @@ class FastQwen2:
             self._ws_release("mlp", nxt)
             del act
             x = h1
+            self._tl_mark(f"f{i}")
         del y, xq, xv, y2
         store.retire(self.L)
         hf = torch.empty((n, D), dtype=f32, device=dev)
@@ -954,13 +962,69 @@ class FastQwen2:
         rms_forward(x, self.w_final, yf, rstd_f, self.eps, delta=d16, xout=hf,
                     dummy16=self.dummy16, dummy32=self.dummy32)
         del x, d16
+        self._tl_mark("head0")
         loss_sum, stats, dy_head = self._head(yf, batch)
+        self._tl_mark("head1")
         del yf
         batch.e_target = None
         self.steps += 1
         saved = dict(store=store, plan=plan, hf=hf, rstd_f=rstd_f, dy_head=dy_head, seeds=seeds,
                      batch=batch, rstd2=rstd2_all)
         return loss_sum, stats, saved
+
+    # ------------------------------------------------------------------ step timeline (log only)
+    def _tl_mark(self, name):
+        tl = getattr(self, "_tl", None)
+        if tl is not None and not tl.get("done"):
+            ev = torch.cuda.Event(enable_timing=True)
+            ev.record()
+            tl["ev"].append((name, ev, time.perf_counter()))
+
+    def _timeline_start(self, batch):
+        """config.STEP_TIMELINE: CUDA events on the main stream at every layer of a few steps;
+        the next step's start prints where the GPU time of the step went (nothing else changes)."""
+        tl = getattr(self, "_tl", None)
+        if tl is not None:
+            self._tl = None
+            try:
+                self._timeline_report(tl)
+            except Exception as exc:  # noqa: BLE001 - diagnostics never disturb the run
+                print(f"[solution] timeline: not available ({type(exc).__name__}: {exc})",
+                      flush=True)
+        if config.STEP_TIMELINE and self.steps in config.STEP_TIMELINE:
+            self._tl = {"ev": [], "n": batch.n, "n_lab": batch.n_lab, "step": self.steps + 1}
+            self._tl_mark("start")
+
+    def _timeline_report(self, tl):
+        import sys
+        nxt = torch.cuda.Event(enable_timing=True)
+        nxt.record()
+        nxt.synchronize()
+        ev = dict((name, e) for name, e, _ in tl["ev"])
+        cpu = dict((name, t) for name, _, t in tl["ev"])
+        if "b0" not in ev:
+            return
+
+        def ms(a, b):
+            return ev[a].elapsed_time(ev[b])
+
+        L = self.L
+        fl = [ms("start" if i == 0 else f"f{i - 1}", f"f{i}") for i in range(L)]
+        bl = [ms("b" if i == L - 1 else f"b{i + 1}", f"b{i}") for i in reversed(range(L))]
+
+        def dist(v):
+            v = sorted(v)
+            return f"{v[0]:.2f}/{v[len(v) // 2]:.2f}/{v[-1]:.2f}"
+
+        print(f"[solution] timeline step {tl['step']} ({tl['n']} tokens, {tl['n_lab']} supervised): "
+              f"forward {ms('start', f'f{L - 1}'):.1f} ms (layer min/med/max {dist(fl)}), "
+              f"final norm + head {ms(f'f{L - 1}', 'head1'):.1f} ms, autograd turn "
+              f"{ms('head1', 'b'):.1f} ms, backward {ms('b', 'b0'):.1f} ms (layer {dist(bl)}), "
+              f"end of backward -> next step {ev['b0'].elapsed_time(nxt):.1f} ms; "
+              f"CPU: forward queued in {1000 * (cpu['head1'] - cpu['start']):.0f} ms, backward in "
+              f"{1000 * (cpu['b0'] - cpu['b']):.0f} ms, GPU finished the forward "
+              f"{ms('start', 'head1') - 1000 * (cpu['head1'] - cpu['start']):.0f} ms after the CPU "
+              f"had queued it", file=sys.stderr, flush=True)
 
     def _head(self, yf, batch):
         # the head's GEMMs (incl. the fp32-accumulating one) keep PyTorch's default library choice
@@ -977,6 +1041,7 @@ class FastQwen2:
         n, D = batch.n, self.D
         dev = self.device
         f16, f32 = torch.float16, torch.float32
+        self._tl_mark("b")
         gscale = (g_loss.detach().reshape(1).to(f32) / float(config.HEAD_GRAD_SCALE)).contiguous()
         dh = torch.empty((n, D), dtype=f32, device=dev)
         dh16 = torch.empty((n, D), dtype=f16, device=dev)     # fp16 copy of dh for the GEMMs
@@ -1076,6 +1141,7 @@ class FastQwen2:
                 del lqx, lvx
             del qkv, gq, gv, aq, av, daq, dav, dy1, x
             grads[4 * i:4 * i + 4] = [d_aq, d_bq, d_av, d_bv]
+            self._tl_mark(f"b{i}")
         store.close()
         self.flush()          # the whole backward is queued: record this step's metrics now
         return grads

@@ -533,7 +533,9 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
                      f"the host buffers and freed")
         except Exception as exc:  # noqa: BLE001
             _log(f"placement check failed: {type(exc).__name__}: {exc}")
-        from . import hostmem
+        from . import distmap, hostmem
+        distmap.restore()
+        torch.cuda.empty_cache()          # the self-test's and the load's leftovers, before the peak
         _log(f"first step starts (GPU {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated; "
              f"host buffers: {hostmem.describe()})")
     batch = runner.pack(inputs["input_ids"], inputs["attention_mask"], inputs["labels"])

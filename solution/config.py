@@ -67,6 +67,9 @@ HEAD_GRAD_SCALE = 1024.0
 # A batch with more tokens than HOST_CAPACITY (4 rows x 512 tokens is the task's maximum) is
 # recomputed instead, with the same result.
 SAVE_GU = True
+# Release layer i-1's saved activations (once copied out) before layer i's gate|up GEMM instead of
+# at the start of layer i+1: one layer less of them on the GPU at the forward's memory peak.
+EARLY_RETIRE = True
 SAVE_ATTN = True
 HOST_CAPACITY = 2048
 
@@ -99,6 +102,9 @@ PRECOMPILE_THREADS = 1
 # Keep the tied embedding / lm_head in fp16 (bit-exact: the checkpoint is loaded as fp16 on a T4
 # and only upcast to fp32 by prepare_model_for_kbit_training).
 FP16_EMBEDDING = True
+
+# Log where the GPU time of these steps went (CUDA events per layer; log only). () = off.
+STEP_TIMELINE = (5, 6)
 
 # Print one line per phase (setup, first steps) to the training log.
 VERBOSE = True

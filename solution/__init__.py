@@ -21,34 +21,6 @@ See README.md for what the kernels do and why. Files:
 
 
 
-import contextlib
-
-
-@contextlib.contextmanager
-def _shared_distribution_map():
-    """TRL's import_utils recomputes importlib.metadata.packages_distributions() at import (2.4 s
-    of file reads on Kaggle), the same map transformers computed when it was imported. While
-    apply() imports Soup's stack, that call returns a copy of transformers' map instead (the set
-    of installed packages cannot change in between); the function is restored right after."""
-    import importlib.metadata as md
-
-    orig = md.packages_distributions
-    try:
-        from transformers.utils import import_utils as iu
-
-        cached = iu.PACKAGE_DISTRIBUTION_MAPPING
-        if not isinstance(cached, dict) or not cached:
-            raise ValueError("no map")
-        md.packages_distributions = lambda: {k: list(v) for k, v in cached.items()}
-    except Exception:  # noqa: BLE001 - compute it as usual
-        orig = None
-    try:
-        yield
-    finally:
-        if orig is not None:
-            md.packages_distributions = orig
-
-
 def apply():
     from . import config, integration, precompile, profile_setup
 
@@ -67,8 +39,9 @@ def apply():
             hostmem.start(pinned_specs())    # ~4 GB of pinned host buffers, in the background
         except Exception:  # noqa: BLE001 - FastQwen2 allocates them itself later
             pass
-    with _shared_distribution_map():
-        integration.install()    # fast path: model load to host, fused compute_loss in train()
+    from . import distmap
+    distmap.share()              # until the first training step (see distmap.py)
+    integration.install()        # fast path: model load to host, fused compute_loss in train()
     if not config.FAST_PATH:
         from .swiglu import patch_qwen2_mlp
         patch_qwen2_mlp()        # the example (stock path only); its kernels never count
