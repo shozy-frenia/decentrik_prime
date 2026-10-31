@@ -24,6 +24,21 @@ accuracy, `num_tokens`, `rewind.jsonl`).
 
 All 10 checks of `harness/check_rules.py`: `<PASS/FAIL>` (output in the notebook).
 
+### How we got there (our solution alone, `run_task.py --only solution`, Kaggle T4)
+
+Each row is a measured run; per-step GPU times are from `--profile` (`torch.profiler`).
+
+| Version | What changed | `soup train`, s | 64 steps, s | median step, s | peak, MiB | eval loss |
+|---|---|---|---|---|---|---|
+| v1 | fused kernels, packing, recompute, fused head, **our Triton attention** | 108.1 | 81.2 | 1.137 | 1915 | 2.0495 |
+| v3 | attention → PyTorch's SDPA on a padded view | 55.95 | 31.63 | 0.445 | 1795 | 2.0496 |
+| v4 | varlen attention (`cu_seqlens`, no padding), dequant on a side stream, launchers built ahead | 51.98 | 27.97 | 0.420 | 1815 | 2.0495 |
+| v5 | gate\|up and attention activations kept in pinned host memory instead of recomputed; faster GQA epilogue | *pending* | | | | |
+
+v4 profile per step (GPU, 378 ms): cuBLAS GEMMs 275 ms (72 %), our kernels 74 ms (dequant 31,
+norms 16, SwiGLU 13, QKV epilogue 9, head 5), attention 23 ms. In-process A/B on the same
+batches: varlen attention vs padded SDPA −54 ms/step; dequant overlap −8 ms/step.
+
 ## Where base Soup spends its time and memory (and what we did about it)
 
 We read the exact code that runs (Soup 0.77.0 `trainer/sft.py` + `trainer/rewind_hf.py`,
@@ -34,7 +49,7 @@ step does this:
 | Base behaviour | Cost | Our change |
 |---|---|---|
 | Batches right-padded to the longest row: a mean of ~45 % of the tokens in the GEMMs are padding | ~2× wasted FLOPs | **padding-free packing**: the 4 rows are concatenated, padding is never computed |
-| No gradient checkpointing: every layer keeps its activations (gate/up alone are 36 KB per token per layer) | ~7–9 GB | **per-layer recomputation in our own backward**: only the fp32 residual entering each layer is kept (6 KB/token/layer) |
+| No gradient checkpointing: every layer keeps its activations (gate/up alone are 36 KB per token per layer) | ~7–9 GB | **our own backward with layer checkpoints**: only the fp32 residual entering each layer stays on the GPU (6 KB/token/layer). The expensive activations (gate\|up output, post-RoPE QKV, attention output and LSE, O-projection output: 45 KB/token/layer) are **copied to pinned host memory by the copy engine while the forward computes the next layer, and copied back one layer ahead in the backward**, so the backward does not recompute them and the GPU only holds the 2–3 layers in flight; anything else (norms, dropout masks, LoRA-A outputs) is recomputed |
 | Logits `[4, T, 151936]` materialised many times: fp16 GEMM out, accelerate's fp32 copy, the loss' fp32 upcast, log-softmax for backward, TRL's entropy chunks, the argmax for accuracy, rewind's per-row CE | several GB + ~10 % of time in memory-bound passes | **fused LM head**: logits only for 256 tokens at a time, one Triton pass gives loss, entropy, argmax-accuracy, per-row loss and the logit gradient; d(hidden) is computed in the forward |
 | Tied embedding/`lm_head` upcast to fp32 (934 MB) by `prepare_model_for_kbit_training`, re-cast to fp16 by autocast for every `lm_head` call | 934 MB + 467 MB transient + time | **kept fp16** — bit-exact: on a T4 Soup loads the checkpoint as fp16, so the fp32 copy only ever holds fp16 values |
 | fp32 residual stream with ~10 small elementwise kernels per norm, RoPE via `cat`/`rotate_half`, LoRA dropout in fp32, PEFT's `result.clone()`, SwiGLU in fp32 | ~44 % of GPU time | **fused kernels**: residual+RMSNorm+both dropout masks; LoRA-add+RoPE; SwiGLU on a fused buffer |
@@ -66,11 +81,25 @@ untouched.
 ### How the step is organised (`solution/fast_qwen.py`)
 
 * **One autograd node for the whole model** (`FusedCausalLM`): inputs are the 112 LoRA tensors,
-  output the summed CE. The forward runs the 28 layers on the packed batch and keeps only each
-  layer's fp32 input (optionally in pinned host memory); the backward re-runs each layer's
-  forward from its checkpoint and back-propagates through it by hand (fp16 cuBLAS GEMMs with the
-  dequantised weights, our kernels for everything else), so at most one layer's activations are
-  alive. LoRA gradients follow autocast's fp16 GEMM semantics and land in the fp32 `.grad`.
+  output the summed CE. The forward runs the 28 layers on the packed batch and keeps each layer's
+  fp32 input on the GPU; the backward back-propagates through each layer by hand (fp16 cuBLAS
+  GEMMs with the dequantised weights, our kernels for everything else). LoRA gradients follow
+  autocast's fp16 GEMM semantics and land in the fp32 `.grad`.
+* **Activations through host memory** (`_ActStore`, `SAVE_GU`/`SAVE_ATTN`): per layer the forward
+  queues device-to-host copies of the gate|up output, the post-RoPE QKV, the attention output
+  (+ the attention kernel's log-sum-exp, kept on the GPU) and the O-projection output into
+  pinned arenas (allocated in a background thread while Soup builds the trainer); the backward
+  queues the host-to-device copies one layer ahead into the blocks the previous layer just
+  released. With these, the backward of a layer is: norm-1 again (rstd and the Philox dropout
+  masks, no GEMM) → LoRA-A GEMMs → norm-2 again from the saved O output → MLP backward on the
+  saved gate|up → attention backward on the saved QKV/output/LSE → LoRA gradients. What it no
+  longer runs: the gate|up GEMM (the largest), the QKV and O GEMMs, the QKV epilogue and the
+  attention forward. Ordering is by events only: the copy stream waits for the producer; a
+  source tensor is released only after the main stream has queued a wait for its copy (two
+  layers later, so a slow copy stalls the GPU instead of growing memory); a prefetch starts
+  after the main stream reached its allocation, so it never overwrites a block a queued kernel
+  still reads (`dev/test_act_store.py` checks this on a model of streams, events and the caching
+  allocator, and catches both mutations).
 * **Compute order per layer**: dequant (1 launch) → norm+dropout → LoRA-A GEMMs → fused QKV GEMM
   (bias via `addmm`, as bitsandbytes does) → LoRA-B GEMMs → QKV epilogue → attention
   (`aten::_efficient_attention_forward/backward` with `cu_seqlens`, causal per packed row; Q is a
@@ -96,6 +125,8 @@ untouched.
   streamed copy, RMSNorm vs fp64 autograd incl. both LoRA branches and mask regeneration, RoPE vs
   HF's formula with autograd, attention vs SDPA per sequence with autograd, gated SiLU, the head
   vs `cross_entropy`/`log_softmax`/`argmax`).
+* `dev/test_act_store.py` (CPU): the activation store under the same kind of model, plus the
+  caching allocator's block reuse: every conflicting access pair to a GPU block is ordered.
 * `dev/test_ws_schedule.py` (CPU): the dequantisation schedule driven through a model of CUDA
   streams and events: every GEMM reads the expected layer, no dequant overwrites weights that a
   queued GEMM still reads (a mutated schedule is caught).
@@ -120,6 +151,7 @@ untouched.
 | Same task | model, data, batch order (the trainer's sampler/collator are untouched), steps, LoRA r/alpha/dropout/targets, optimizer, schedule, loss; no Soup switch changed (`gradient_checkpointing`, `packing`, `use_liger`, ...): recomputation and padding removal are our own code |
 | Same Soup outputs | the metrics and rewind records are computed as TRL/Soup do (see above) |
 | Clean measurement | no CUDA graphs, no extra processes, no caches, same allocator; behaviour does not depend on being measured or tested |
+| Soup's built-in modes | untouched: `gradient_checkpointing`, `activation_offloading`, `packing` stay off; the layer checkpoints, the host-memory activation store and the padding removal are our own code inside our forward/backward |
 | Soup's tests | patches are guarded (fake modules in the tests never qualify) |
 
 ## How to run
@@ -151,8 +183,10 @@ checkpoints / 4-bit weights, background compilation).
   q/v, fp16, SFT, single GPU); anything else silently uses stock Soup.
 * LoRA dropout masks are not bit-identical to PyTorch's stream, so the loss curve is not
   bit-identical to the base after step 1 (it is a different, equally valid dropout draw).
-* Recomputation costs one extra forward of the Q|K|V, O and gate|up GEMMs (~35 % more GEMM FLOPs);
-  we trade it for the memory win. GEMMs remain cuBLAS on dequantised fp16 weights: a fused NF4
+* The activation round trip through host memory needs the PCIe link to keep up with the forward
+  (45 KB per token per layer, ~40 MB per layer for an 850-token batch, i.e. ~3 ms per layer at
+  12 GB/s against ~4.6 ms of compute); on a slower link the forward waits for the copies (the
+  dev check measures the link). GEMMs remain cuBLAS on dequantised fp16 weights: a fused NF4
   GEMM in Triton would run on FMA units on this GPU (next point).
 * The load phase (transformers quantising on the GPU) sets a floor of ~1.5 GB for the peak:
   streaming the weights from host memory only pays off below that floor.
