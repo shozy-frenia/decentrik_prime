@@ -365,7 +365,9 @@ class FastQwen2:
                      if host_all is not None else None)
         torch.cuda.empty_cache()     # whatever the load left in the cache goes back to the driver
 
-        self.keep_scale = 1.0 / (1.0 - self.p_drop)
+        # PyTorch's dropout scale: 1 / (1 - p), with 1 - p rounded to fp32 first (as the CUDA
+        # kernel does); bit-identical to the base's fp32 dropout output before the fp16 cast
+        self.keep_scale = 1.0 / float(torch.tensor(1.0 - self.p_drop, dtype=torch.float32))
         self.code2 = code2
         self.nf4 = torch.tensor(NF4_CODE, dtype=torch.float32, device=dev)
         self.w_final = qwen.norm.weight.data.to(dev).float().contiguous()
@@ -437,8 +439,9 @@ class FastQwen2:
         self.dummy16 = torch.zeros(16, dtype=torch.float16, device=dev)
         self.dummy32 = torch.zeros(16, dtype=torch.float32, device=dev)
         self.one = torch.ones(1, dtype=torch.float32, device=dev)
-        self.gen = torch.Generator(device="cpu")
-        self.gen.manual_seed(int(seed) & 0x7FFFFFFF)
+        # LoRA dropout masks: PyTorch's own (native_dropout on the global CUDA generator, as PEFT's
+        # lora_dropout in the base run); the self-test draws from a private generator instead
+        self._mask_gen = None
         self.steps = 0
         self._pending = None
 
@@ -536,9 +539,10 @@ class FastQwen2:
         chunk), then one forward + backward of a small synthetic batch through every kernel, stream
         and copy path of the step (finite loss, statistics and LoRA gradients). Raises on any
         failure; the caller then falls back (integration._runner_ready). Leaves no trace: the
-        dropout generator, step counter and LoRA gradients are restored."""
+        step counter and LoRA gradients are restored, and its dropout masks come from a private
+        generator (PyTorch's global RNG streams are never touched by it)."""
         self.ready()
-        gen_state, steps, n_dq = self.gen.get_state(), self.steps, self.n_dequant
+        steps, n_dq = self.steps, self.n_dequant
         try:
             started = time.perf_counter()
             head = self._head_check()
@@ -548,7 +552,7 @@ class FastQwen2:
         finally:
             for p in self.lora_params:
                 p.grad = None
-            self.gen.set_state(gen_state)
+            self._mask_gen = None
             self.steps, self.n_dequant = steps, n_dq
             self._pending = None
 
@@ -629,6 +633,8 @@ class FastQwen2:
         if batch is None:
             raise RuntimeError("self-test batch could not be packed")
         self._rx_check = {"max": 0.0}
+        self._mask_gen = torch.Generator(device=self.device)
+        self._mask_gen.manual_seed(31102026)
         try:
             loss_sum, stats = run_step(self, batch)
             loss_sum.backward()
@@ -731,8 +737,37 @@ class FastQwen2:
         if self.pipe is not None:
             self.pipe.prefetch(j)
 
-    def _seeds(self):
-        return torch.randint(1, 2 ** 31 - 1, (2 * self.L,), generator=self.gen).tolist()
+    # ------------------------------------------------------------------ LoRA dropout masks
+    def _rng(self):
+        """Where the LoRA dropout masks come from: PyTorch's default CUDA generator, the one the
+        base run's lora_dropout (nn.Dropout -> at::native_dropout) draws from, or the self-test's
+        private generator."""
+        if self._mask_gen is not None:
+            return self._mask_gen
+        idx = self.device.index if self.device.index is not None else torch.cuda.current_device()
+        return torch.cuda.default_generators[idx]
+
+    def _draw_masks(self, batch, mq, mv):
+        """One layer's keep-masks, q_proj's then v_proj's, into mq / mv (uint8 [N, D], packed
+        tokens). They are PyTorch's own: torch.native_dropout on an fp32 [B, T, D] tensor, the
+        padded batch the base run's lora_dropout sees, one call each in the base's order, so the
+        generator advances exactly as in the base and the masks are bit-identical to its masks.
+        Only the mask is used; the input values are irrelevant to it, so the input is a view of
+        the weight workspace (no extra memory), and the fp32 output is dropped at once."""
+        numel = batch.B * batch.T * self.D
+        ws = getattr(self, "ws", None)
+        src = ws[:2 * numel].view(torch.float32) if ws is not None and 2 * numel <= ws.numel() else None
+        for dst in (mq, mv):
+            if self._mask_gen is not None:
+                keep = torch.rand(numel, device=self.device, generator=self._mask_gen) >= self.p_drop
+            else:
+                if src is None:
+                    src = torch.empty(numel, dtype=torch.float32, device=self.device)
+                out, keep = torch.native_dropout(src, self.p_drop, True)
+                del out
+            torch.index_select(keep.view(batch.B * batch.T, self.D), 0, batch.flat,
+                               out=dst.view(torch.bool))
+            del keep
 
     # ------------------------------------------------------------------ deferred metrics
     def defer(self, fn):
@@ -784,7 +819,8 @@ class FastQwen2:
         for x in lens_l:
             cu.append(cu[-1] + x)
         tgt_sorted = tgt[perm]
-        parts = [ids, pos, tgt_sorted, perm, inv, torch.tensor(cu)]
+        flat = row * T + pos                   # packed token -> row of the padded [B * T] batch
+        parts = [ids, pos, tgt_sorted, perm, inv, torch.tensor(cu), flat]
         if self.attn_impl == "triton":
             parts += [torch.tensor(block_table(lens_l, FWD_BLOCK_M)), torch.tensor(block_table(lens_l, BWD_BLOCK))]
         offs, chunks, at = [], [], 0
@@ -803,8 +839,9 @@ class FastQwen2:
         batch.n, batch.B, batch.lens = n, B, lens_l
         batch.ids, batch.pos, batch.tgt_sorted, batch.perm, batch.inv = views[:5]
         batch.cu = views[5]
+        batch.flat, batch.T = views[6], T
         if self.attn_impl == "triton":
-            tab_f, tab_b = views[6], views[7]
+            tab_f, tab_b = views[7], views[8]
             batch.meta = AttnMeta(batch.cu, tab_f, tab_b, tab_f.numel() // 2, tab_b.numel() // 2, n)
         batch.n_lab = int(valid.sum())
         batch.Tm = max(lens_l)
@@ -935,7 +972,6 @@ class FastQwen2:
         self._refresh_lora16()
         if self.overlap:
             self.dq_stream.wait_stream(torch.cuda.current_stream(dev))
-        seeds = self._seeds()
         plan = self._save_plan(n)
         self.last_plan = plan
         store = _ActStore(self, n)
@@ -949,6 +985,14 @@ class FastQwen2:
         # (rows padded to 16 bytes: Triton specialises pointers on 16-byte alignment, and an
         # unaligned row would compile another variant of the norm kernels mid-run)
         rstd2_all = torch.empty((self.L, -(-n // 4) * 4), dtype=f32, device=dev)[:, :n]
+        # the LoRA dropout keep-masks of one layer (the next layer's are drawn once this layer's
+        # norm 1 has used them), and the generator state before each layer's draws, from which
+        # the backward draws the same masks again
+        mq = torch.empty((n, D), dtype=torch.uint8, device=dev)
+        mv = torch.empty((n, D), dtype=torch.uint8, device=dev)
+        rng = self._rng()
+        rng_states = [rng.get_state()]
+        self._draw_masks(batch, mq, mv)
         x = batch.x0.float()
         batch.x0 = None
         d16 = None
@@ -956,14 +1000,13 @@ class FastQwen2:
             if i == self.L - 1:
                 self.emb_source.start()        # the head's first embedding chunks, under the last layer
             if i == 0:
-                rms_forward(x, self.w_in[0], y, rstd, self.eps, xq=xq, xv=xv, p_drop=self.p_drop,
-                            keep_scale=self.keep_scale, seed_q=seeds[0], seed_v=seeds[1],
-                            dummy16=self.dummy16, dummy32=self.dummy32)
+                rms_forward(x, self.w_in[0], y, rstd, self.eps, xq=xq, xv=xv, mq=mq, mv=mv,
+                            keep_scale=self.keep_scale, dummy16=self.dummy16, dummy32=self.dummy32)
             else:
                 x_new = torch.empty((n, D), dtype=f32, device=dev)
                 rms_forward(x, self.w_in[i], y, rstd, self.eps, delta=d16, xout=x_new, xq=xq, xv=xv,
-                            p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
-                            seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
+                            mq=mq, mv=mv, keep_scale=self.keep_scale, dummy16=self.dummy16,
+                            dummy32=self.dummy32)
                 x = x_new
             store.retire(i - store.IN_FLIGHT)
             if not plan.rx:
@@ -1002,6 +1045,11 @@ class FastQwen2:
                 # i.e. a down GEMM and an attention block ago. One layer of saved activations
                 # less at the forward's peak (~44 MB for 838 tokens).
                 store.retire(i - 1)
+            if i + 1 < self.L:
+                # layer i+1's masks (norm 1 of layer i has been queued): here the block of layer
+                # i-1's gate|up has just been released, so the draw's transient fp32 output fits
+                rng_states.append(rng.get_state())
+                self._draw_masks(batch, mq, mv)
             parts = int(config.GU_SPLIT) if (plan.gu and i < self.L - 1) else 1
             if parts > 1 and n >= 32 * parts:
                 # gate|up in row blocks: each block's copy to the host arena starts as soon as its
@@ -1039,7 +1087,8 @@ class FastQwen2:
             del act
             x = h1
             self._tl_mark(f"f{i}")
-        del y, xq, xv, y2
+        del y, xq, xv, y2, mq, mv
+        rng_after = rng.get_state()
         store.retire(self.L)
         hf = torch.empty((n, D), dtype=f32, device=dev)
         yf = torch.empty((n, D), dtype=f16, device=dev)
@@ -1053,8 +1102,8 @@ class FastQwen2:
         del yf
         batch.e_target = None
         self.steps += 1
-        saved = dict(store=store, plan=plan, hf=hf, rstd_f=rstd_f, dy_head=dy_head, seeds=seeds,
-                     batch=batch, rstd2=rstd2_all)
+        saved = dict(store=store, plan=plan, hf=hf, rstd_f=rstd_f, dy_head=dy_head,
+                     rng=(rng, rng_states, rng_after), batch=batch, rstd2=rstd2_all)
         return loss_sum, stats, saved
 
     # ------------------------------------------------------------------ step timeline (log only)
@@ -1122,7 +1171,8 @@ class FastQwen2:
 
     # ------------------------------------------------------------------ backward
     def backward(self, saved, g_loss):
-        batch, store, seeds, plan = saved["batch"], saved["store"], saved["seeds"], saved["plan"]
+        batch, store, plan = saved["batch"], saved["store"], saved["plan"]
+        rng, rng_states, rng_after = saved.pop("rng")
         n, D = batch.n, self.D
         dev = self.device
         f16, f32 = torch.float16, torch.float32
@@ -1140,6 +1190,8 @@ class FastQwen2:
         y2 = None if plan.gu else torch.empty((n, D), dtype=f16, device=dev)
         rstd1 = torch.empty(n, dtype=f32, device=dev)
         rstd2 = torch.empty(n, dtype=f32, device=dev)
+        mq = torch.empty((n, D), dtype=torch.uint8, device=dev)
+        mv = torch.empty((n, D), dtype=torch.uint8, device=dev)
         rstd2_all = saved.pop("rstd2")
         grads = [None] * len(self.lora_params)
         s = self.lora_scale
@@ -1170,11 +1222,18 @@ class FastQwen2:
                     store.prefetch(i - 1, "op")
             aq16, bq16, av16, bv16 = self.lora16[4 * i:4 * i + 4]
             prv = i - 1 if i > 0 else None
-            # norm 1 again: the dropout-masked LoRA inputs (same Philox seeds) and rstd; y itself
-            # only when the attention is recomputed
-            rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv,
-                        p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
-                        seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
+
+            def norm1_again():
+                # norm 1 again: the dropout-masked LoRA inputs and rstd (y itself only when the
+                # attention is recomputed), with layer i's masks drawn again from the generator
+                # state the forward drew them from
+                rng.set_state(rng_states[i])
+                self._draw_masks(batch, mq, mv)
+                rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv, mq=mq, mv=mv,
+                            keep_scale=self.keep_scale, dummy16=self.dummy16, dummy32=self.dummy32)
+
+            if not plan.attn:
+                norm1_again()                   # the attention recompute needs y, xq, xv first
             if plan.attn:
                 aq = store.get(i, "aq")
                 av = store.get(i, "av")
@@ -1209,6 +1268,8 @@ class FastQwen2:
                 self._ws_release("dn", i, "gu")
                 gated_silu_backward(gu, dact)
                 del dact
+                if plan.attn:
+                    norm1_again()               # into the block dact has just released
                 self._ws_use("gu", i)
                 dy2 = torch.mm(gu, self.W_gu)
                 self._ws_release("gu", prv, "dn")
@@ -1219,6 +1280,8 @@ class FastQwen2:
                 dact = torch.mm(dh16, self.W_d)
                 gated_silu_backward(gu, dact)
                 del dact
+                if plan.attn:
+                    norm1_again()
                 dy2 = torch.mm(gu, self.W_gu)
                 self._ws_release("mlp", prv)    # layer i-1's MLP weights dequantise under the attention backward
             del gu
@@ -1260,14 +1323,16 @@ class FastQwen2:
                 lqx = torch.mm(daq, aq16)
                 lvx = torch.mm(dav, av16)
                 rms_backward(dy1, self.one, x, self.w_in[i], rstd1, dh, dres=dh, lq=lqx, lv=lvx,
-                             p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
-                             seed_v=seeds[2 * i + 1], out16=dh16, dummy16=self.dummy16,
-                             dummy32=self.dummy32)
+                             mq=mq, mv=mv, keep_scale=self.keep_scale, out16=dh16,
+                             dummy16=self.dummy16, dummy32=self.dummy32)
                 del lqx, lvx
             del qkv, gq, gv, aq, av, daq, dav, dy1, x
             grads[4 * i:4 * i + 4] = [d_aq, d_bq, d_av, d_bv]
             self._tl_mark(f"b{i}")
         store.close()
+        # the generator continues from where the forward left it (as after the base's backward,
+        # whose checkpoint recomputes restore the RNG state they replayed)
+        rng.set_state(rng_after)
         self.flush()          # the whole backward is queued: record this step's metrics now
         return grads
 

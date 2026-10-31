@@ -7,8 +7,8 @@ Forward, one program per token row (hidden 1536 held in registers):
     y16    = fp16(y)                                          what bitsandbytes casts to for the GEMMs
     xq16   = fp16(dropout_q(y)), xv16 = fp16(dropout_v(y))    PEFT's lora_dropout on the fp32 input,
                                                               then autocast's fp16 cast for lora_A
-The dropout masks come from Philox (tl.rand) keyed by (seed, token*1536+col), so the backward pass
-regenerates exactly the same masks instead of storing them.
+The dropout keep-masks are inputs (uint8 [N, 1536], packed token order): PyTorch's own dropout
+masks, drawn by fast_qwen from PyTorch's CUDA generator exactly as the base run draws them (v15).
 
 Backward, one program per row (x may be given as x + delta, recomputed in registers):
     dy   = fp16 grad of y16 (from the GEMM) * gscale
@@ -26,10 +26,9 @@ HIDDEN_BLOCK = 2048     # next power of two above 1536
 NORM_WARPS = 8
 
 
-@triton.jit(do_not_specialize=["n_rows", "seed_q", "seed_v", "add_delta", "write_x", "dropout",
-                               "write_y"])
-def rms_fwd_kernel(x_ptr, delta_ptr, xout_ptr, w_ptr, y_ptr, rstd_ptr, xq_ptr, xv_ptr,
-                   n_rows, eps, p_drop, keep_scale, seed_q, seed_v, add_delta, write_x, dropout,
+@triton.jit(do_not_specialize=["n_rows", "add_delta", "write_x", "dropout", "write_y"])
+def rms_fwd_kernel(x_ptr, delta_ptr, xout_ptr, w_ptr, y_ptr, rstd_ptr, xq_ptr, xv_ptr, mq_ptr, mv_ptr,
+                   n_rows, eps, keep_scale, add_delta, write_x, dropout,
                    write_y, D: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -48,16 +47,15 @@ def rms_fwd_kernel(x_ptr, delta_ptr, xout_ptr, w_ptr, y_ptr, rstd_ptr, xq_ptr, x
     if write_y != 0:
         tl.store(y_ptr + off, y.to(tl.float16), mask=cm)
     if dropout != 0:
-        keep_q = tl.rand(seed_q, off) >= p_drop
+        keep_q = tl.load(mq_ptr + off, mask=cm, other=0) != 0
         tl.store(xq_ptr + off, tl.where(keep_q, y * keep_scale, 0.0).to(tl.float16), mask=cm)
-        keep_v = tl.rand(seed_v, off) >= p_drop
+        keep_v = tl.load(mv_ptr + off, mask=cm, other=0) != 0
         tl.store(xv_ptr + off, tl.where(keep_v, y * keep_scale, 0.0).to(tl.float16), mask=cm)
 
 
-@triton.jit(do_not_specialize=["n_rows", "seed_q", "seed_v", "use_lora", "has_res", "write16",
-                               "add_delta"])
+@triton.jit(do_not_specialize=["n_rows", "use_lora", "has_res", "write16", "add_delta"])
 def rms_bwd_kernel(dy_ptr, gscale_ptr, x_ptr, delta_ptr, w_ptr, rstd_ptr, dres_ptr, out_ptr, lq_ptr,
-                   lv_ptr, out16_ptr, n_rows, p_drop, keep_scale, seed_q, seed_v, use_lora, has_res,
+                   lv_ptr, out16_ptr, mq_ptr, mv_ptr, n_rows, keep_scale, use_lora, has_res,
                    write16, add_delta, D: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -65,10 +63,10 @@ def rms_bwd_kernel(dy_ptr, gscale_ptr, x_ptr, delta_ptr, w_ptr, rstd_ptr, dres_p
     off = row * D + cols
     dy = tl.load(dy_ptr + off, mask=cm, other=0.0).to(tl.float32) * tl.load(gscale_ptr)
     if use_lora != 0:
-        keep_q = tl.rand(seed_q, off) >= p_drop
+        keep_q = tl.load(mq_ptr + off, mask=cm, other=0) != 0
         lq = tl.load(lq_ptr + off, mask=cm, other=0.0).to(tl.float32)
         dy += tl.where(keep_q, lq * keep_scale, 0.0)
-        keep_v = tl.rand(seed_v, off) >= p_drop
+        keep_v = tl.load(mv_ptr + off, mask=cm, other=0) != 0
         lv = tl.load(lv_ptr + off, mask=cm, other=0.0).to(tl.float32)
         dy += tl.where(keep_v, lv * keep_scale, 0.0)
     x = tl.load(x_ptr + off, mask=cm, other=0.0)
@@ -89,45 +87,64 @@ def rms_bwd_kernel(dy_ptr, gscale_ptr, x_ptr, delta_ptr, w_ptr, rstd_ptr, dres_p
         tl.store(out16_ptr + off, dx.to(tl.float16), mask=cm)
 
 
-def rms_forward(x, w, y, rstd, eps, *, delta=None, xout=None, xq=None, xv=None,
-                p_drop=0.0, keep_scale=1.0, seed_q=0, seed_v=0, dummy16=None, dummy32=None):
+_DUMMY8 = {}
+
+
+def _dummy8(device):
+    """A uint8 stand-in for unused mask pointers (one kernel variant: masks are always *u8)."""
+    t = _DUMMY8.get(device)
+    if t is None:
+        import torch
+        t = _DUMMY8[device] = torch.zeros(16, dtype=torch.uint8, device=device)
+    return t
+
+
+def rms_forward(x, w, y, rstd, eps, *, delta=None, xout=None, xq=None, xv=None, mq=None, mv=None,
+                keep_scale=1.0, dummy16=None, dummy32=None):
     """y=None: rstd and the dropout-masked LoRA inputs only (the backward's norm-1 recompute
-    when the attention activations were kept)."""
+    when the attention activations were kept). xq/xv need the uint8 keep-masks mq/mv."""
     n, d = x.shape
     dropout = xq is not None
+    if dropout and (mq is None or mv is None):
+        raise ValueError("the LoRA dropout outputs need their keep-masks")
+    d8 = _dummy8(x.device)
     rms_fwd_kernel[(n,)](
         x, delta if delta is not None else dummy16, xout if xout is not None else dummy32, w,
         y if y is not None else dummy16, rstd,
         xq if dropout else dummy16, xv if dropout else dummy16,
-        n, float(eps), float(p_drop), float(keep_scale), int(seed_q), int(seed_v),
+        mq if dropout else d8, mv if dropout else d8,
+        n, float(eps), float(keep_scale),
         int(delta is not None), int(xout is not None), int(dropout), int(y is not None),
         D=d, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)
 
 
-def rms_backward(dy16, gscale, x, w, rstd, out, *, dres=None, lq=None, lv=None, p_drop=0.0,
-                 keep_scale=1.0, seed_q=0, seed_v=0, out16=None, delta=None, dummy16=None,
-                 dummy32=None):
+def rms_backward(dy16, gscale, x, w, rstd, out, *, dres=None, lq=None, lv=None, mq=None, mv=None,
+                 keep_scale=1.0, out16=None, delta=None, dummy16=None, dummy32=None):
     """delta: the norm's input is x + delta (fp16), added in registers as in the forward, so the
-    backward needs no recomputed copy of it."""
+    backward needs no recomputed copy of it. lq/lv (LoRA-A input grads) need the keep-masks."""
     n, d = x.shape
     use_lora = lq is not None
+    if use_lora and (mq is None or mv is None):
+        raise ValueError("the LoRA input gradients need their keep-masks")
+    d8 = _dummy8(x.device)
     rms_bwd_kernel[(n,)](
         dy16, gscale, x, delta if delta is not None else dummy16, w, rstd,
         dres if dres is not None else dummy32, out,
         lq if use_lora else dummy16, lv if use_lora else dummy16,
         out16 if out16 is not None else dummy16,
-        n, float(p_drop), float(keep_scale), int(seed_q), int(seed_v), int(use_lora),
+        mq if use_lora else d8, mv if use_lora else d8,
+        n, float(keep_scale), int(use_lora),
         int(dres is not None), int(out16 is not None), int(delta is not None),
         D=d, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)
 
 
 def warmup_specs(hidden):
     import torch
-    f32, f16 = torch.float32, torch.float16
+    f32, f16, u8 = torch.float32, torch.float16, torch.uint8
     return [
-        (rms_fwd_kernel, (f32, f16, f32, f32, f16, f32, f16, f16, 1, 1e-6, 0.05, 1.05, 1, 1, 1, 1, 1, 1),
+        (rms_fwd_kernel, (f32, f16, f32, f32, f16, f32, f16, f16, u8, u8, 1, 1e-6, 1.05, 1, 1, 1, 1),
          dict(D=hidden, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)),
-        (rms_bwd_kernel, (f16, f32, f32, f16, f32, f32, f32, f32, f16, f16, f16, 1, 0.05, 1.05, 1, 1, 1,
-                          1, 1, 1),
+        (rms_bwd_kernel, (f16, f32, f32, f16, f32, f32, f32, f32, f16, f16, f16, u8, u8, 1, 1.05,
+                          1, 1, 1, 1),
          dict(D=hidden, BLOCK=HIDDEN_BLOCK, num_warps=NORM_WARPS)),
     ]

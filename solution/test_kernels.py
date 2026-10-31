@@ -141,7 +141,7 @@ def test_rmsnorm_forward_backward_and_dropout():
 
     torch.manual_seed(1)
     n, d, eps, p = 300, 1536, 1e-6, 0.05
-    ks = 1.0 / (1.0 - p)
+    ks = 1.0 / float(torch.tensor(1.0 - p, dtype=torch.float32))
     x = torch.randn(n, d, device=DEV)
     delta = (torch.randn(n, d, device=DEV) * 0.5).half()
     w = torch.rand(d, device=DEV) + 0.5
@@ -150,24 +150,22 @@ def test_rmsnorm_forward_backward_and_dropout():
     xout = torch.empty(n, d, device=DEV)
     rstd = torch.empty(n, device=DEV)
     d16, d32 = torch.zeros(16, dtype=torch.float16, device=DEV), torch.zeros(16, device=DEV)
-    rms_forward(x, w, y, rstd, eps, delta=delta, xout=xout, xq=xq, xv=xv, p_drop=p, keep_scale=ks,
-                seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+    # v15: the keep-masks are PyTorch's own dropout masks, passed in as uint8
+    _, keep_q = torch.native_dropout(torch.empty(n, d, device=DEV), p, True)
+    _, keep_v = torch.native_dropout(torch.empty(n, d, device=DEV), p, True)
+    mq, mv = keep_q.view(torch.uint8), keep_v.view(torch.uint8)
+    rms_forward(x, w, y, rstd, eps, delta=delta, xout=xout, xq=xq, xv=xv, mq=mq, mv=mv, keep_scale=ks,
+                dummy16=d16, dummy32=d32)
     h = x + delta.float()
     ref = w * (h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps))
     assert torch.equal(xout, h)
     _close(y, ref.half(), 2e-3, 2e-3, "y")
-    keep_q, keep_v = xq != 0, xv != 0
-    nz = y != 0
-    rate = keep_q[nz].float().mean().item()
-    assert abs(rate - 0.95) < 0.01, rate
-    assert (keep_q != keep_v).float().mean().item() > 0.05      # independent masks
-    _close(xq[keep_q], (ref * ks).half()[keep_q], 2e-3, 2e-3, "dropout")
-    # same seed -> same mask (the backward regenerates it)
+    # the LoRA inputs: PyTorch's dropout (this mask, scale 1/(1-p)) of the norm output, in fp16
+    _close(xq.float(), (ref * keep_q * ks).half().float(), 2e-3, 2e-3, "dropout q")
+    _close(xv.float(), (ref * keep_v * ks).half().float(), 2e-3, 2e-3, "dropout v")
+    assert torch.equal(xq[~keep_q], torch.zeros_like(xq[~keep_q]))
+    assert torch.equal(xv[~keep_v], torch.zeros_like(xv[~keep_v]))
     xq2, xv2 = torch.empty_like(y), torch.empty_like(y)
-    rms_forward(xout, w, y, rstd, eps, xq=xq2, xv=xv2, p_drop=p, keep_scale=ks, seed_q=123, seed_v=456,
-                dummy16=d16, dummy32=d32)
-    assert torch.equal((xq2 != 0) & nz, keep_q & nz)
-    assert torch.equal((xv2 != 0) & nz, keep_v & nz)
     # backward vs autograd, including the two LoRA input-grad branches and the residual
     dy16 = torch.randn(n, d, device=DEV).half()
     lq = (torch.randn(n, d, device=DEV) * 0.3).half()
@@ -180,24 +178,24 @@ def test_rmsnorm_forward_backward_and_dropout():
     (yy * upstream).sum().backward()
     out = dres.clone()
     out16 = torch.empty(n, d, dtype=torch.float16, device=DEV)
-    rms_backward(dy16, gscale, h, w, rstd, out, dres=out, lq=lq, lv=lv, p_drop=p, keep_scale=ks,
-                 seed_q=123, seed_v=456, out16=out16, dummy16=d16, dummy32=d32)
+    rms_backward(dy16, gscale, h, w, rstd, out, dres=out, lq=lq, lv=lv, mq=mq, mv=mv, keep_scale=ks,
+                 out16=out16, dummy16=d16, dummy32=d32)
     _close(out, hh.grad + dres.double(), 1e-4, 1e-4, "rms backward")
     assert torch.equal(out16, out.half())
     # v7: the backward given the norm input as x + delta (no recomputed h) is bit-identical
     out_d = dres.clone()
     out16_d = torch.empty_like(out16)
-    rms_backward(dy16, gscale, x, w, rstd, out_d, dres=out_d, lq=lq, lv=lv, p_drop=p, keep_scale=ks,
-                 seed_q=123, seed_v=456, out16=out16_d, delta=delta, dummy16=d16, dummy32=d32)
+    rms_backward(dy16, gscale, x, w, rstd, out_d, dres=out_d, lq=lq, lv=lv, mq=mq, mv=mv, keep_scale=ks,
+                 out16=out16_d, delta=delta, dummy16=d16, dummy32=d32)
     assert torch.equal(out_d, out) and torch.equal(out16_d, out16)
     # v7: the forward without y (the backward's norm-1 recompute) writes the same rstd and masks
     y_keep = torch.full_like(y, 3.0)
     rstd3, xq3, xv3 = torch.empty_like(rstd), torch.empty_like(y), torch.empty_like(y)
-    rms_forward(x, w, None, rstd3, eps, delta=delta, xq=xq3, xv=xv3, p_drop=p, keep_scale=ks,
-                seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+    rms_forward(x, w, None, rstd3, eps, delta=delta, xq=xq3, xv=xv3, mq=mq, mv=mv, keep_scale=ks,
+                dummy16=d16, dummy32=d32)
     rstd_ref = torch.empty_like(rstd)
-    rms_forward(x, w, y_keep, rstd_ref, eps, delta=delta, xq=xq2, xv=xv2, p_drop=p, keep_scale=ks,
-                seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+    rms_forward(x, w, y_keep, rstd_ref, eps, delta=delta, xq=xq2, xv=xv2, mq=mq, mv=mv, keep_scale=ks,
+                dummy16=d16, dummy32=d32)
     assert torch.equal(rstd3, rstd_ref) and torch.equal(xq3, xq2) and torch.equal(xv3, xv2)
     # dummy16 must be large enough for nothing: y=None never writes through the dummy
     assert torch.equal(d16, torch.zeros_like(d16))

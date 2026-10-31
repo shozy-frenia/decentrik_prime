@@ -607,9 +607,6 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
         from . import profile_setup
         profile_setup.phase(None)         # the setup profile ends at the first step
         profile_setup.report("setup")
-        if config.GC_TUNE:
-            import gc
-            gc.freeze()                   # setup's objects never get scanned again by the GC
         try:
             freed = runner.reclaim_gpu_copies()
             if freed:
@@ -625,6 +622,12 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
             torch._C._cuda_clearCublasWorkspaces()
         except Exception:  # noqa: BLE001
             pass
+        if config.OFFLOAD_OPTIMIZER and getattr(self, "optimizer", None) is not None:
+            try:
+                from . import optstate
+                _log("optimizer: " + optstate.install(self.optimizer, runner.device))
+            except Exception as exc:  # noqa: BLE001 - the states then simply stay on the GPU
+                _log(f"optimizer state offload not installed: {type(exc).__name__}: {exc}")
         torch.cuda.empty_cache()          # the self-test's and the load's leftovers, before the peak
         if "stack" in _CTX:
             from . import cudactx

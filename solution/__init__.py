@@ -32,11 +32,6 @@ def apply():
         import os
         # read by PyTorch when it creates the first cuBLAS workspace (no GEMM has run yet)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
-    if config.GC_TUNE:
-        import gc
-        # fewer cyclic-GC passes while Soup imports its stack and builds the run (every pass of
-        # the oldest generation walks millions of objects); frozen at the first training step
-        gc.set_threshold(max(gc.get_threshold()[0], 50000), *gc.get_threshold()[1:])
     precompile.start()           # compile our kernels while Soup imports, tokenises and loads
     if config.FAST_PATH and config.EARLY_PINNED:
         try:

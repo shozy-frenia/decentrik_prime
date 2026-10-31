@@ -104,8 +104,11 @@ EARLY_RELEASE = True
 # itself for any kernel that needs more (cudactx.py).
 CUDA_STACK_BYTES = 16
 # cuBLAS workspace of 8 x 16 KiB per handle and stream (CUBLAS_WORKSPACE_CONFIG=:16:8) instead of
-# ~8 MiB. Off: not cleared with the organisers; it can also make some small GEMMs slower.
-CUBLAS_SMALL_WORKSPACE = False
+# ~8 MiB (cleared with the organisers, Q51). cuBLAS may then pick other GEMM algorithms.
+CUBLAS_SMALL_WORKSPACE = True
+# AdamW's moment buffers (17 MB) in pinned host memory between optimizer steps, copied in before
+# and out after each step by optimizer step hooks (optstate.py; cleared with the organisers, Q50).
+OFFLOAD_OPTIMIZER = True
 # Let HF Trainer's per-step walks over the model (model.parameters() in gradient clipping,
 # model.zero_grad()) use lists taken once at the start of training: same parameters in the same
 # order, and only the trainable ones can hold a gradient to clear (checked when installed).
@@ -144,10 +147,7 @@ VERBOSE = True
 # (solution/profile_setup.py). Log only; it changes nothing the run computes.
 SETUP_PROFILE = False
 
-# Python's cyclic GC: a higher generation-0 threshold from apply() on (fewer full passes over the
-# millions of objects Soup's imports create), and gc.freeze() at the first training step. Changes
-# when garbage cycles are collected, nothing else (reference counting frees tensors as before).
-GC_TUNE = True
+# (v15: no GC tuning of any kind: gc.freeze() / raised GC thresholds are not allowed, Q31.)
 
 # Experimental (A/B in dev/check_fast_path.py): run the layer GEMMs through cuBLASLt instead of
 # cuBLAS (torch.backends.cuda.preferred_blas_library), set around our forward and backward only.
