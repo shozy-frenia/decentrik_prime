@@ -67,5 +67,5 @@ memory, quality), limits and next steps.
   memory-efficient attention; our kernels do the memory-bound work.
 - LoRA dropout masks come from our Philox stream, not PyTorch's: same distribution, not the same
   draw, so the loss curve matches the base within tolerance but not bit for bit after step 1.
-- v6/v7 (the streamed placement, the trimmed backward) have not been measured on a T4 yet; fill
+- v8 (hf_device_map fix, exact-size registered host buffers, early unpinning) is unmeasured; v6 measured 51.2 s / 1751 MiB (1070 MiB of it were duplicate weights copied by accelerate, fixed in v8).
   the tables above from the notebook run, not from the README's estimates.
