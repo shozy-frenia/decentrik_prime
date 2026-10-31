@@ -34,7 +34,7 @@ touches the GPU in full even while it loads.
 
 | Links | |
 |---|---|
-| Public Kaggle notebook (final run) | `[<KAGGLE NOTEBOOK LINK>](https://www.kaggle.com/code/shozyfrenia/notebook724966b1eb)` (fill in: the notebook's public URL) |
+| Public Kaggle notebook (final run) | `(https://www.kaggle.com/code/shozyfrenia/notebook724966b1eb)` |
 | Final commit | `<COMMIT LINK>` |
 
 ## Results (Kaggle T4, `harness/run_task.py --repeats 2`, public eval rows)
