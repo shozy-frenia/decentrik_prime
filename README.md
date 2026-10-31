@@ -7,6 +7,26 @@ forward/backward of the model, plugged into Soup through `solution.apply()`. It 
 adapter: same model, data, batches, LoRA (dropout included), optimizer, schedule, loss, and the
 same Soup outputs (loss, entropy, token accuracy, `num_tokens`, `rewind.jsonl`).
 
+## At a glance (final version: v17)
+
+* **What it is:** our own forward/backward of Qwen2.5-1.5B (QLoRA) with 9 Triton kernels of our
+  own, plugged into the unchanged `soup train` through `solution.apply()`.
+* **Measured on the Kaggle T4** (`run_task.py --only solution`): v17 **47.6 s, 443 MiB peak,
+  eval loss 2.04964** — the base needs ≈ 80 s and ≈ 14 GB (v16: 50.3 s, 407 MiB; see the table).
+* **Why it is light:** between uses the GPU holds no model weights. The 4-bit layers (680 MB),
+  the fp16 embedding (467 MB), every activation the backward needs and AdamW's moments live in
+  page-locked host memory; the copy engines stream them through ~40 MB of GPU workspace (one
+  attention region, one MLP region that gate, up and down take turns in) while the kernels run.
+* **Why it is fast:** packed (unpadded) tokens and varlen attention, fused RMSNorm + residual +
+  LoRA-dropout, fused QKV/LoRA/RoPE epilogue, fused SwiGLU, a one-pass streamed LM head with an
+  online softmax, dequantisation on a side stream, and kernels compiled before the first step.
+* **Same training as the base:** same model tensors, data order, batches, LoRA init, optimizer and
+  schedule; the LoRA dropout masks are PyTorch's own (bit-identical draw, Q47); every computed
+  value is checked against the base at start-up (self-test) and by `dev/` and `pytest` checks.
+* **Rules:** every change listed in *Rules compliance* was either ruled allowed by the organisers
+  (Q50 optimizer states in host memory, Q51 cuBLAS workspace, pinned offload, stack limit, package
+  map) or changes no computed value; what was ruled out (GC tuning, own-RNG dropout) was removed.
+
 **v6 in one sentence:** between uses, the GPU holds no model weights at all — the 4-bit layers,
 the fp16 embedding and every activation the backward needs live in pinned host memory and are
 streamed through the GPU by the copy engines while the kernels compute, and the model never
@@ -39,14 +59,60 @@ Each row is a measured run, except where marked *pending*.
 | v3 | attention → PyTorch's SDPA on a padded view | 55.95 | 31.63 | 0.445 | 1795 | 2.0496 |
 | v4 | varlen attention (`cu_seqlens`, no padding), dequant on a side stream, launchers built ahead | 51.98 | 27.97 | 0.420 | 1815 | 2.0495 |
 | v5 | gate\|up and attention activations kept in pinned host memory instead of recomputed | 51.83 | 26.22 | 0.393 | 1939 | 2.0495 |
-| v6 | model streamed from host memory (weights, embedding, checkpoints), loaded off the GPU, streamed vocabulary-chunk LM head, no sync between forward and backward | *pending* | | | | |
-| v7 | v6 + backward without the norm-2 recompute and without recomputing the LoRA-A projections, lighter norm-1 recompute, GC tuning, start-up self-test with fallback, setup profiler | *pending* | | | | |
+| v6 | model streamed from host memory (weights, embedding, checkpoints), loaded off the GPU, streamed vocabulary-chunk LM head, no sync between forward and backward | 51.24 | 23.41 | 0.346 | 1751 | 2.0495 |
+| v8 | v7 + no duplicate weights on the GPU (`hf_device_map`: accelerate had copied the host-resident model to the GPU, +1070 MiB), exact-size registered page-locked buffers, unpinned during wrap-up | 47.17 | 22.9 | | 661 | 2.04953 |
+| v10 | + TRL reuses transformers' package map, bf16→fp16 load conversion on the GPU, 2 × 2048-row head ring | 45.27 | 22.5 | | 641 | 2.04948 |
+| v11 | + package map shared until step 1, forward frees layer i-1's saved activations before layer i's gate\|up | 45.33 | 24.1 | | 541 | 2.04952 |
+| v12 | + gate\|up in two row blocks, each copied out as soon as computed (removes v11's waits), 1024-row head chunks | 44.07 | 22.95 | | 543 | 2.04951 |
+| v13 | + CUDA per-thread stack limit, embedding read straight into page-locked memory, self-test's cuBLAS workspace freed, cached step-boundary traversals | 44.27 | 23.09 | | 521 | 2.04952 |
+| v14 | + gate\|up and down weights share one workspace region (94 → 66 MB) — *last version with GC tuning and own-RNG dropout, both since ruled out* | 45.03 | 23.6 | | 481 | 2.04951 |
+| v15 | **rule fixes**: PyTorch's own LoRA dropout masks (Q47), no GC tuning (Q31); + AdamW moments in pinned host memory between steps (Q50), 128 KiB cuBLAS workspace (Q51) | 49.64 | 25.7 | | 427 | 2.04966 |
+| v16 | + gate and up take turns in the MLP workspace region (66 → 38 MB); allocator `expandable_segments:True` | 50.34 | 26.3 | | 407 | 2.04965 |
+| **v17** | v16 with PyTorch's default cuBLAS workspace again (the small one slowed the LM head by 13–26 ms/step; head back to 40–42 ms) | **47.63** | 23.6 | | **443** | **2.04964** |
+
+Where v15's +4.6 s went (from the logs): ≈ 0.8 s of Soup's setup and ≈ 1.6 s of interpreter
+exit come back with Python's default GC (Q31: no `gc.freeze`/thresholds), ≈ 1 s is the base's own
+dropout masks (two `native_dropout` calls per layer on the padded fp32 batch, forward and backward),
+≈ 1–1.5 s the small cuBLAS workspace (undone in v17). Where the memory went: −17 MiB AdamW moments,
+−16 MiB cuBLAS workspaces before training, −28 MB weight workspace (v16), less allocator slack.
 
 v5 measured profile (per step, `--profile`, GPU time with overlaps): cuBLAS GEMMs ≈ 276 ms,
 pinned↔GPU copies 79 + 74 ms (on the copy engines, overlapped), our dequant 33 ms (side stream),
 attention 25 ms, our norms 18 ms, SwiGLU 13 ms, head 5 ms. In-process A/B of v5 on the same
 batches: keeping activations instead of recomputing −99 ms/step; residual checkpoints on the host
 −189 MiB for +11 ms/step.
+
+## v8–v14: the measured rounds (what each change bought)
+
+Every row above is one `run_task.py --only solution` run on a Kaggle T4; the step timeline
+(`config.STEP_TIMELINE`, CUDA events per layer on two steps) splits a 853-token step of v13 into:
+forward 130 ms (compute-bound, ~4.8 ms per layer), LM head 45 ms (PCIe-bound: the 467 MB fp16
+embedding at ~11.5 GB/s), backward 158 ms (PCIe-bound: ~64 MB per layer of weights and saved
+activations, the per-layer time equals the copy time), and 27 ms between steps (HF/TRL/Soup and
+the harness's synchronisations).
+
+* **Memory 1751 → 521 MiB.** The big one was not ours to compute but ours to prevent:
+  transformers 5 does not set `hf_device_map` for a single-device load, so accelerate's
+  `prepare_model` called `model.to("cuda")` and copied the host-resident 4-bit weights and the
+  embedding back to the GPU as unused duplicates (+1070 MiB). We set the map (as Soup's own
+  layer-streaming runtime does) and check at step 1 that nothing was moved. Then: the forward frees
+  layer i-1's saved activations before layer i's gate|up output exists, with gate|up computed in
+  two row blocks whose copies to the host start as soon as each block is done (no waiting); the
+  allocator's cache is released before any batch larger than all before it; the CUDA per-thread
+  stack limit is set to 16 bytes (`cuCtxSetLimit`; the driver raises it by itself for kernels that
+  need more) instead of 1 KiB × 40 SMs × 1024 threads; the LM head streams 1024-row chunks through
+  2 buffers; gate|up and down take turns in one workspace region (v14).
+* **Time 51.2 → 44.1 s.** TRL's import recomputed `importlib.metadata.packages_distributions()`
+  (2.4 s of file reads); it now gets a copy of the identical map transformers computed earlier in
+  the process, until step 1. The checkpoint's bf16 tensors are converted to fp16 on the GPU while
+  loading (same IEEE rounding), and the embedding is read straight into the page-locked buffer the
+  head streams from. Host buffers are registered at their exact size (PyTorch's pinned allocator
+  rounds to powers of two: 4.75 instead of 3.76 GiB) and unpinned while Soup saves the adapter.
+* **Tried and dropped, by measurement.** Rebuilding the residual stream backwards
+  (x_i = x_{i+1} − d_i − o_i, to save fp16 MLP outputs instead of fp32 checkpoints): the self-test
+  measured a 6.9e-3 relative error, because Qwen's massive activations (|x| in the thousands in a
+  few channels) make the fp32 subtraction lose the small values of early layers; the self-test
+  switched it off by itself and it stays off (`RECONSTRUCT_X`).
 
 ## v7: where the step time goes, and what was cut
 
@@ -66,8 +132,11 @@ head), so v7 removes work around them:
   layer) stay on the GPU from the forward: 56 tiny GEMMs fewer per step.
 * **Lighter norm-1 recompute.** When the attention activations were kept, the backward's norm-1
   pass writes only rstd and the two dropout-masked LoRA inputs, not the GEMM input it no longer needs.
-* **Python GC.** A higher generation-0 threshold while Soup builds the run and `gc.freeze()` at
-  the first step (full GC passes walk millions of objects); the per-phase GC time is logged.
+* **No GC tuning (v15).** v8–v14 raised the generation-0 GC threshold and called `gc.freeze()`;
+  the organisers ruled that out (Q31), so v15 leaves Python's GC exactly as it is.
+* **v15 memory:** AdamW's moment buffers (17 MB) live in one pinned host buffer between optimizer
+  steps (step pre/post hooks copy them in and out; same optimizer, same kernels — Q50), and the
+  cuBLAS workspace is `CUBLAS_WORKSPACE_CONFIG=:16:8` (Q51).
 * **Measurement for the rest** (`solution/profile_setup.py`, log only): about half of the 51.8 s
   of v5 was outside the 64 steps (harness start ≈ 5 s, imports ≈ 5 s, Soup's data preparation
   ≈ 5 s, model load ≈ 3 s, trainer construction ≈ 4 s, save and exit ≈ 3.5 s). A sampling
@@ -122,7 +191,7 @@ starts the backward from the workspace, and the slots still hold the layer befor
 | `head_chunk_kernel` (v6) | `k_head.py` | fp32 logits copies, `cross_entropy`, `log_softmax`, TRL `entropy_from_logits`, `argmax`, rewind's per-row CE, the logits gradient | One program per token row of one **vocabulary chunk** of logits `[N, 4096]` (one cuBLAS GEMM `Y·E_cᵀ`). Pass 1: chunk max + first-index argmax. Pass 2: `Σe^{x−m_c}` and `Σe^{x−m_c}(x−m_c)` merged into the row's running (max, sum, entropy sum, argmax, target logit) — an online softmax over the vocabulary, i.e. flash attention with the hidden states as queries and the embedding as keys *and* values; for rows with a target the same pass writes `P = 1024·e^{x−m_run}` in place (target column zeroed) and rescales the row's fp32 gradient accumulator by `e^{m_old−m_run}`. A cuBLAS GEMM with fp32 output then adds `P·E_c` to that accumulator in place. |
 | `head_finalize_kernel` (v6) | `k_head.py` | — | Per row: `lse`, entropy `log s − t/s`, loss `lse − x_t`, accuracy hit, and `d(hidden) = acc/(1024 s) + (p_t−1)·E_t` written straight into token order. The target term is added in fp32 from the gathered row `E_t`, not through the fp16 `P` matrix: for a confident prediction the gradient is a small difference of two nearly equal vectors. |
 | `nf4_layer_dequant_kernel` | `k_nf4.py` | 7× bitsandbytes `dequantize_4bit` per layer per pass | At setup the 7 NF4 weights of a layer are repacked into one buffer `[nibbles \| absmax codes \| 2nd-level scales \| offsets]` (in pinned host memory in v6). One launch per layer half (attention part, MLP part) decodes `fp16(NF4[nibble] · (code2[q]·absmax2 + offset))` for 8192 weights per program (`tl.join` interleaves the two nibbles of a byte), writing the fused Q\|K\|V, O, gate\|up, down matrices. Launched with FMA fusion off: bit-exact vs bitsandbytes. |
-| `rms_fwd_kernel` | `k_norm.py` | Qwen2RMSNorm (fp32, ~6 kernels) + residual add + PEFT's two `lora_dropout` + autocast casts | One program per token: `x = x_prev + delta`, `rstd`, `y = w·(x·rstd)`, writes the fp32 residual (the layer checkpoint), fp16 `y` for the GEMMs and both dropout-masked LoRA inputs. Masks come from Philox (`tl.rand`) keyed by token×column, so backward regenerates them instead of storing them. |
+| `rms_fwd_kernel` | `k_norm.py` | Qwen2RMSNorm (fp32, ~6 kernels) + residual add + PEFT's two `lora_dropout` + autocast casts | One program per token: `x = x_prev + delta`, `rstd`, `y = w·(x·rstd)`, writes the fp32 residual (the layer checkpoint), fp16 `y` for the GEMMs and both dropout-masked LoRA inputs. v15: the keep-masks are inputs — PyTorch's own `native_dropout` masks (see "LoRA dropout"). |
 | `rms_bwd_kernel` | `k_norm.py` | autograd of the above + dropout backward + residual-grad accumulation | `dx = rstd·(g − x̂·mean(g·x̂))`, `g = w·(dy + mask_q·dLoRA_q + mask_v·dLoRA_v)`, accumulated in place into the fp32 residual gradient. v7: the norm input can be given as `x + delta` and is rebuilt in registers (no recomputed copy), with the forward's rstd. |
 | `qkv_epilogue_fwd_kernel` | `k_rope.py` | PEFT's LoRA add for q/v, `apply_rotary_pos_emb` (`rotate_half`, `cat`), the fp16 casts for SDPA | In place on the fused QKV GEMM output: `q += 2·lora_q`, rotate q and k with the model's cos/sin, `v += 2·lora_v`. |
 | `qkv_epilogue_bwd_kernel` | `k_rope.py` | RoPE backward + GQA reduction | Transposed rotation, summing the 6 per-query-head dK/dV partials of each KV head, writes the fp16 grad of the fused QKV output. |
@@ -154,8 +223,9 @@ starts the backward from the workspace, and the slots still hold the layer befor
   the embedding copied chunk by chunk, not through the ring): loss, lse, entropy and d(hidden)
   must agree to fp16-logit precision; (2) one forward + backward of a small synthetic batch through
   every kernel, stream and copy path of the configured placement: finite loss, statistics and
-  all 112 LoRA gradients. It uses its own random generators and restores the dropout generator,
-  step counter and gradients, so nothing reaches training. If the streamed placement fails it (an
+  all 112 LoRA gradients. It uses its own random generators (a private CUDA generator for the dropout masks;
+  PyTorch's global RNG is never touched) and restores the step counter and gradients, so nothing
+  reaches training. If the streamed placement fails it (an
   exception, a Triton compile error, a mismatch, a non-finite value), the model is rebuilt in the
   **v5 placement** (weights and fp16 embedding on the GPU, v5 head), which is tested the same way;
   if that fails too, stock Soup runs. If Soup's model setup itself fails with our host-loading
@@ -223,10 +293,14 @@ starts the backward from the workspace, and the slots still hold the layer befor
   and the cross-warp reductions after that pass order every read before the in-place writes of
   the next one (the v5 head kernel got the same change).
 * Differences from the base that remain: summation order inside GEMMs/reductions (fused QKV and
-  gate\|up GEMMs, a different M per GEMM, vocabulary chunks in the head), and the LoRA dropout masks
-  come from a different random stream (Philox keyed by our own seeded generator instead of
-  PyTorch's CUDA RNG). With `lora_B = 0` at init the first-step loss is identical; afterwards the
-  run is a different dropout draw of the same training, well within checks 5–7.
+  gate\|up GEMMs, a different M per GEMM, vocabulary chunks in the head), nothing else. **LoRA dropout (v15, Q47):** the masks are PyTorch's own: for each layer,
+  `torch.native_dropout` (the kernel `nn.Dropout` runs on CUDA) on an fp32 `[B, T, 1536]` tensor —
+  the padded batch PEFT's `lora_dropout` sees — once for q_proj and once for v_proj, in the base's
+  order, from PyTorch's default CUDA generator; the mask is gathered to the packed tokens (uint8)
+  and the kernels apply it with PyTorch's fp32 scale `1/(1-p)`. The backward draws the same masks
+  again from the generator state saved before each layer and then restores the post-forward
+  state, as the base's checkpoint recompute does. So the generator advances exactly as in the
+  base and every mask is bit-identical to the base's.
 
 ## Rules compliance
 
@@ -239,6 +313,7 @@ starts the backward from the workspace, and the slots still hold the layer befor
 | Soup's built-in modes | untouched: `gradient_checkpointing`, `activation_offloading`, `stream_layers`, `packing`, `use_cut_ce`, `fast_lora` stay off; the offloading, streaming, recomputation and padding removal are our own code inside our forward/backward |
 | Clean measurement | no CUDA graphs, no extra processes (background *threads* of the measured process only: compilation, pinned allocation, the model repack, the start-up self-test and the log-only setup profiler), no caches, the harness's allocator settings unchanged; behaviour does not depend on being measured or tested (the self-test and its fallbacks run identically in every run) |
 | Soup's tests | patches are guarded (fake modules in the tests never qualify), loading patches are pass-through unless the fast plan is active |
+| Setup-time changes (v8–v13) | each one leaves every computed value unchanged and was cleared with the organisers where it was not obvious: the package map is the identical map transformers computed earlier in the same process, returned as a copy and restored at step 1; bf16→fp16 conversion of the checkpoint on the GPU (same rounding), the embedding read straight into page-locked memory; the CUDA stack limit (`cuCtxSetLimit`, the driver raises it for any kernel that needs more); own page-locked buffers unpinned after the last step, after a device synchronisation, inside the measured run; `hf_device_map` is the marker Soup's own streaming runtime sets. v15: `CUBLAS_WORKSPACE_CONFIG=:16:8` (Q51) and the optimizer-state hooks (Q50). Not used: any change to `datasets.map` or its fingerprint, `os._exit`, GC tuning (removed in v15, Q31), own-RNG dropout masks (removed in v15, Q47) |
 
 ## How to run
 
@@ -281,8 +356,7 @@ compilation/allocation, deferred metrics, the start-up self-test (`SELF_TEST`,
 * Pinned host memory: ~4 GB (weights 0.68, embedding 0.47, activation arenas 2.9 for the task's
   maximum batch of 2048 tokens). Allocation is in the background; releasing it at exit is part of
   the measured time.
-* LoRA dropout masks are not bit-identical to PyTorch's stream, so the loss curve is not
-  bit-identical to the base after step 1 (it is a different, equally valid dropout draw).
+* (v15) LoRA dropout masks are now PyTorch's own, bit-identical to the base's draw.
 * **v6 has not been measured yet.** Every v6 number in this README is an estimate from v5's
   measurements and the PCIe budget above, not a result; the v6 row of the table stays *pending*
   until `dev/kaggle_dev_check.ipynb` and the full notebook have run on a T4. The self-test guards

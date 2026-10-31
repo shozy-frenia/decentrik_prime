@@ -65,7 +65,8 @@ memory, quality), limits and next steps.
   batches (`RESIDENT_LAYERS` trades GPU memory back for time). ~4 GB of pinned host memory.
 - Triton 3.6 has no tensor-core `tl.dot` on sm_75, so all matmuls stay in cuBLAS / PyTorch's
   memory-efficient attention; our kernels do the memory-bound work.
-- LoRA dropout masks come from our Philox stream, not PyTorch's: same distribution, not the same
-  draw, so the loss curve matches the base within tolerance but not bit for bit after step 1.
-- Measured on Kaggle T4 (`run_task.py --only solution`): v8 47.2 s / 661 MiB; v10 45.3 s / 641 MiB; v11 45.3 s / 541 MiB, eval loss 2.04952. v12 (gate|up copied out in row blocks, residual stream rebuilt in the backward instead of fp32 checkpoints, 1024-row head chunks, cache release before larger batches) is unmeasured.
+- v15: LoRA dropout masks are PyTorch's own (`native_dropout` on the global CUDA generator, base
+  order and shapes), bit-identical to the base; no GC tuning (Q31); AdamW moments in pinned host
+  memory between steps (Q50); `CUBLAS_WORKSPACE_CONFIG=:16:8` (Q51).
+- Measured on Kaggle T4 (`run_task.py --only solution`): v8 47.2 s / 661 MiB; v10 45.3 s / 641 MiB; v11 45.3 s / 541 MiB; v12 44.1 s / 543 MiB; v13 44.3 s / 521 MiB, eval loss 2.04952. v14 45.0 s / 481 MiB, eval loss 2.04951. v15 49.6 s / 427 MiB, eval loss 2.04966; v16 50.3 s / 407 MiB, eval loss 2.04965. v17 (= v16 with the default cuBLAS workspace, final) 47.6 s / 443 MiB, eval loss 2.04964.
   the tables above from the notebook run, not from the README's estimates.
