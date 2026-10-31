@@ -27,24 +27,24 @@ same Soup outputs (loss, entropy, token accuracy, `num_tokens`, `rewind.jsonl`).
   (Q50 optimizer states in host memory, Q51 cuBLAS workspace, pinned offload, stack limit, package
   map) or changes no computed value; what was ruled out (GC tuning, own-RNG dropout) was removed.
 
-**v6 in one sentence:** between uses, the GPU holds no model weights at all — the 4-bit layers,
-the fp16 embedding and every activation the backward needs live in pinned host memory and are
+**In one sentence:** between uses, the GPU holds no model weights at all — the 4-bit layers,
+the fp16 embedding, every activation the backward needs and AdamW's moments live in pinned host memory and are
 streamed through the GPU by the copy engines while the kernels compute, and the model never
 touches the GPU in full even while it loads.
 
 | Links | |
 |---|---|
-| Public Kaggle notebook (final run) | `<KAGGLE NOTEBOOK LINK>` |
+| Public Kaggle notebook (final run) | `<KAGGLE NOTEBOOK LINK>` (fill in: the notebook's public URL) |
 | Final commit | `<COMMIT LINK>` |
 
 ## Results (Kaggle T4, `harness/run_task.py --repeats 2`, public eval rows)
 
-| | Base Soup 0.77.0 | Ours (v6) | Ratio |
+| | Base Soup 0.77.0 | Ours (v17) | Ratio |
 |---|---|---|---|
-| Whole `soup train` command, s | `<base>` | `<ours>` | speedup `<s>`× |
-| of which the 64 training steps, s | `<base>` | `<ours>` | |
-| Peak GPU memory (nvidia-smi), MiB | `<base>` | `<ours>` | base/ours `<m>`× |
-| Eval loss (`eval_adapter.py`) | `<base>` | `<ours>` | `<Δ>` % |
+| Whole `soup train` command, s | `<base>` | 47.63 | speedup `<base / 47.63>`× |
+| of which the 64 training steps, s | `<base>` | 23.6 | |
+| Peak GPU memory (nvidia-smi), MiB | `<base>` | 443 | base/ours `<base / 443>`× |
+| Eval loss (`eval_adapter.py`) | `<base>` | 2.04964 | `<Δ>` % |
 | Our kernels' share of step time (check 4) | – | `<share>` % | |
 
 All 10 checks of `harness/check_rules.py`: `<PASS/FAIL>` (output in the notebook).
