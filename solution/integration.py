@@ -172,6 +172,29 @@ def _patch_loading():
                 _LOAD["error"] = f"{type(exc).__name__}: {exc}"
         return result
 
+    orig_mat = getattr(cml, "_materialize_copy", None)
+    if orig_mat is not None and config.LOAD_CONVERT_ON_GPU:
+        @functools.wraps(orig_mat)
+        def _materialize_copy(tensor, device=None, dtype=None):
+            # transformers' blocking .to(cuda, fp16) converts bf16 -> fp16 on the CPU before the
+            # copy; on the GPU it is the same rounding (bf16 -> fp32 is exact, fp32 -> fp16 is
+            # round-to-nearest-even on both), just much faster. Only while our model loads.
+            if _host_load() and device is not None and dtype is not None:
+                try:
+                    import torch
+
+                    dev = torch.device(device)
+                    t = tensor[...]
+                    if (dev.type == "cuda" and t.device.type == "cpu" and t.is_floating_point()
+                            and t.dtype != dtype):
+                        return t.to(device=dev).to(dtype)
+                    return orig_mat(t, device, dtype)
+                except Exception:  # noqa: BLE001
+                    pass
+            return orig_mat(tensor, device, dtype)
+
+        _materialize_copy._soup_fast = True
+        cml._materialize_copy = _materialize_copy
     get_device._soup_fast = True
     set_param_for_module._soup_fast = True
     cml.get_device = get_device

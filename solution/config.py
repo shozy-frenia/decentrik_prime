@@ -42,13 +42,15 @@ OFFLOAD_CHECKPOINTS = True
 # embedding on the CPU, and move every 4-bit weight to host memory right after bitsandbytes has
 # quantised it on the GPU. The quantisation itself is bitsandbytes' own, on the GPU, as in the base.
 LOAD_TO_HOST = True
+# ... and convert the checkpoint's bf16 tensors to fp16 on the GPU instead of the CPU (bit-exact).
+LOAD_CONVERT_ON_GPU = True
 
 # ---------------------------------------------------------------------------- LM head
 # "chunks" = v6 streamed one-pass head over vocabulary chunks (works with a resident embedding
 #            too); "rows" = v5 head (token chunks against the whole vocabulary, embedding on GPU).
 HEAD_IMPL = "chunks"
-HEAD_VOCAB_CHUNK = 4096     # embedding rows per chunk (12.6 MB fp16); every width is a multiple of 16
-HEAD_RING = 3               # GPU buffers the streamed embedding cycles through
+HEAD_VOCAB_CHUNK = 2048     # embedding rows per chunk (6.3 MB fp16); every width is a multiple of 16
+HEAD_RING = 2               # GPU buffers the streamed embedding cycles through (v10: 2 x 6.3 MB, was 3 x 12.6 MB)
 # v5 head: tokens per chunk (logits are materialised for this many rows: CHUNK x 151936 x 2 bytes).
 HEAD_CHUNK = 256
 
@@ -104,7 +106,7 @@ VERBOSE = True
 # Sample the main thread's Python stack every 20 ms outside the training steps (from apply() to
 # the first step, and from the end of the training loop to exit) and print where the time went
 # (solution/profile_setup.py). Log only; it changes nothing the run computes.
-SETUP_PROFILE = True
+SETUP_PROFILE = False
 
 # Python's cyclic GC: a higher generation-0 threshold from apply() on (fewer full passes over the
 # millions of objects Soup's imports create), and gc.freeze() at the first training step. Changes
