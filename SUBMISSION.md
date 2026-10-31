@@ -67,5 +67,5 @@ memory, quality), limits and next steps.
   memory-efficient attention; our kernels do the memory-bound work.
 - LoRA dropout masks come from our Philox stream, not PyTorch's: same distribution, not the same
   draw, so the loss curve matches the base within tolerance but not bit for bit after step 1.
-- Measured on Kaggle T4 (`run_task.py --only solution`): v8 47.2 s / 661 MiB; v10 45.3 s / 641 MiB, eval loss 2.04948. v11 (package map shared until the first step, earlier release of saved activations in the forward, per-layer step timeline in the log) is unmeasured.
+- Measured on Kaggle T4 (`run_task.py --only solution`): v8 47.2 s / 661 MiB; v10 45.3 s / 641 MiB; v11 45.3 s / 541 MiB, eval loss 2.04952. v12 (gate|up copied out in row blocks, residual stream rebuilt in the backward instead of fp32 checkpoints, 1024-row head chunks, cache release before larger batches) is unmeasured.
   the tables above from the notebook run, not from the README's estimates.
