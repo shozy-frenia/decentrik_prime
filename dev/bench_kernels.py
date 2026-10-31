@@ -221,6 +221,29 @@ def dequant_overlap(n):
     return res
 
 
+def pinned_alloc():
+    """Seconds to allocate pinned host memory (what the activation arenas cost at start-up)."""
+    out = {}
+    for mb in (256, 1024):
+        t0 = time.perf_counter()
+        t = torch.empty(mb << 20, dtype=torch.uint8, pin_memory=True)
+        out[f"{mb}MiB_s"] = round(time.perf_counter() - t0, 3)
+        del t
+    return out
+
+
+def epilogue_gin6(n):
+    from solution.k_rope import qkv_epilogue_backward
+
+    dq = torch.randn(n, 1536, device=DEV).half()
+    dk = torch.randn(n, 1536, device=DEV).half()
+    dv = torch.randn(n, 1536, device=DEV).half()
+    out = torch.empty(n, 2048, device=DEV).half()
+    pos = (torch.arange(n, device=DEV) % 512).int()
+    cos = torch.randn(1024, 128, device=DEV)
+    return round(bench(lambda: qkv_epilogue_backward(dq, dk, dv, pos, cos, cos, out, 12, 2, 128, 6)), 4)
+
+
 def main():
     from solution import precompile
     precompile.start()
@@ -230,6 +253,9 @@ def main():
     for n in (830, 1500):
         RES[f"gemm_N{n}"] = gemms(n)
         print(f"gemm N={n}", RES[f"gemm_N{n}"], flush=True)
+    RES["pinned_alloc"] = pinned_alloc()
+    print("pinned alloc", RES["pinned_alloc"], flush=True)
+    RES["epilogue_bwd_gin6_N830_ms"] = epilogue_gin6(830)
     RES["layer_kernels_N830"] = layer_kernels(830)
     print("kernels", RES["layer_kernels_N830"], flush=True)
     RES["dequant"] = dequant_overlap(830)
@@ -241,7 +267,7 @@ def main():
     except Exception as exc:  # noqa: BLE001
         RES["triton_dot"] = f"{type(exc).__name__}: {exc}"
     print("triton dot", RES["triton_dot"], flush=True)
-    RES["attn_838_of_2036"] = attention([509, 120, 100, 109], [(64, 32, 4, 32, 4)])
+    RES["attn_838_of_2036"] = attention([509, 120, 100, 109], [])
     RES["attn_830_even"] = attention([180, 250, 120, 280], [])
     RES["attn_1724"] = attention([512, 512, 400, 300], [])
     print("\nRESULT " + json.dumps(RES))

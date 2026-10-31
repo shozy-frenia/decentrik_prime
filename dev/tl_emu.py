@@ -149,6 +149,10 @@ def program_id(axis):
     return T(np.int32(_PID[axis]))
 
 
+def static_range(*args):
+    return range(*args)
+
+
 def arange(start, end):
     return T(np.arange(start, end, dtype=np.int32))
 
