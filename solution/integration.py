@@ -42,6 +42,7 @@ from . import config
 
 _PLAN = contextvars.ContextVar("soup_fast_plan", default=None)
 _STATE = {"installed": False}
+_CTX = {}                       # CUDA context settings made in apply() (for the log)
 _LOAD = {"host_weights": 0, "host_bytes": 0, "embedding_cpu": False, "warmup_skipped": False,
          "error": None, "disabled": False}
 
@@ -136,6 +137,39 @@ def _weight_to_host(model, target_name):
     _LOAD["host_bytes"] += int(w.data.numel() * w.data.element_size())
 
 
+def _embedding_to_pinned(tensor, dtype):
+    """The only tensor our hooks load to the CPU is the (tied) embedding. Read it from the
+    checkpoint in blocks of 8192 rows, convert bf16 -> fp16 on the GPU (same rounding as the CPU
+    conversion) and write it straight into the page-locked buffer the fast path streams the LM head
+    from: the table never sits on the GPU as a whole, and no pageable fp16 copy is made first.
+    None (-> the stock path) for anything that is not a 2-D float table."""
+    import torch
+
+    from . import hostmem
+
+    shape = tuple(tensor.get_shape()) if hasattr(tensor, "get_shape") else tuple(tensor.shape)
+    if len(shape) != 2 or shape[0] < 65536 or dtype != torch.float16:
+        return None
+    rows, cols = (int(v) for v in shape)
+    dst = hostmem.take("embedding", (rows, cols), torch.float16)
+    dev = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.current_stream(dev)
+    step = 8192
+    for r0 in range(0, rows, step):
+        r1 = min(rows, r0 + step)
+        part = tensor[r0:r1]
+        if not torch.is_tensor(part) or tuple(part.shape) != (r1 - r0, cols) \
+                or not part.is_floating_point():
+            stream.synchronize()
+            return None
+        g = part.to(dev)
+        dst[r0:r1].copy_(g.to(dtype), non_blocking=True)
+        del g
+    stream.synchronize()
+    _LOAD["embedding_pinned"] = True
+    return dst
+
+
 def _patch_loading():
     try:
         from transformers import core_model_loading as cml
@@ -184,6 +218,10 @@ def _patch_loading():
                     import torch
 
                     dev = torch.device(device)
+                    if dev.type == "cpu" and config.OFFLOAD_EMBEDDING and config.EMBEDDING_DIRECT:
+                        pinned = _embedding_to_pinned(tensor, dtype)
+                        if pinned is not None:
+                            return pinned
                     t = tensor[...]
                     if (dev.type == "cuda" and t.device.type == "cpu" and t.is_floating_point()
                             and t.dtype != dtype):
@@ -314,6 +352,9 @@ def _patch_wrapper():
                         runner.flush()
                     except Exception:  # noqa: BLE001
                         pass
+                    undo = getattr(trainer, "_soup_undo_traversals", None)
+                    if undo is not None:
+                        undo()
                 _log("training, final save and Soup's wrap-up done")
         return orig_train(self, *args, **kwargs)
 
@@ -327,7 +368,9 @@ def _load_note():
     parts = []
     if _LOAD["warmup_skipped"]:
         parts.append("allocator warm-up skipped")
-    if _LOAD["embedding_cpu"]:
+    if _LOAD.get("embedding_pinned"):
+        parts.append("embedding read into page-locked memory (fp16 conversion on the GPU)")
+    elif _LOAD["embedding_cpu"]:
         parts.append("embedding loaded on the CPU")
     if _LOAD["host_weights"]:
         parts.append(f"{_LOAD['host_weights']} 4-bit weights moved to host after quantisation "
@@ -430,6 +473,42 @@ def _trainer_supported(trainer):
     return all(checks)
 
 
+def _cache_traversals(model):
+    """HF Trainer walks the whole model at every step: model.parameters() for gradient clipping
+    (twice, inside accelerate) and model.zero_grad(). The parameter set cannot change during
+    training, and only the trainable (LoRA) parameters can hold a gradient, so both use lists
+    taken once: the same parameters in the same order; zero_grad(set_to_none=True) clears exactly
+    the gradients the full walk would. Returns an undo function, or None if not applicable."""
+    params = list(model.parameters())
+    trainable = [p for p in params if p.requires_grad]
+    if not trainable or any(p.grad is not None for p in params if not p.requires_grad):
+        return None
+    orig_parameters, orig_zero_grad = model.parameters, model.zero_grad
+    frozen_ids = {id(p) for p in params if not p.requires_grad}
+
+    def parameters(recurse=True):
+        if not recurse:
+            return orig_parameters(recurse)
+        return iter(params)
+
+    def zero_grad(set_to_none=True):
+        if not set_to_none:
+            return orig_zero_grad(set_to_none)
+        for p in trainable:
+            p.grad = None
+        return None
+
+    object.__setattr__(model, "parameters", parameters)
+    object.__setattr__(model, "zero_grad", zero_grad)
+
+    def undo():
+        model.__dict__.pop("parameters", None)
+        model.__dict__.pop("zero_grad", None)
+
+    undo.frozen = frozen_ids
+    return undo
+
+
 def _install_on_trainer(trainer, runner):
     if not _trainer_supported(trainer):
         _log("fast path not installed: trainer settings differ from the task")
@@ -480,6 +559,11 @@ def _install_on_trainer(trainer, runner):
         trainer.save_model = save_model
     except Exception as exc:  # noqa: BLE001 - logging only
         _log(f"timeline hooks not installed: {type(exc).__name__}: {exc}")
+    if config.CACHED_TRAVERSALS:
+        try:
+            trainer._soup_undo_traversals = _cache_traversals(trainer.model)
+        except Exception as exc:  # noqa: BLE001 - the full walks stay
+            _log(f"traversal lists not installed: {type(exc).__name__}: {exc}")
     _log("fast compute_loss installed")
     return True
 
@@ -535,7 +619,17 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
             _log(f"placement check failed: {type(exc).__name__}: {exc}")
         from . import distmap, hostmem
         distmap.restore()
+        try:
+            # the build thread's self-test made its own cuBLAS handle and workspace; the training
+            # threads re-create theirs at their next GEMM
+            torch._C._cuda_clearCublasWorkspaces()
+        except Exception:  # noqa: BLE001
+            pass
         torch.cuda.empty_cache()          # the self-test's and the load's leftovers, before the peak
+        if "stack" in _CTX:
+            from . import cudactx
+            _log(f"CUDA stack per thread (bytes): before, after apply() = {_CTX['stack']}; "
+                 f"now {cudactx.stack_now()}")
         _log(f"first step starts (GPU {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated; "
              f"host buffers: {hostmem.describe()})")
     batch = runner.pack(inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
@@ -605,9 +699,6 @@ def _plan_text(runner):
                                   ("checkpoints on host", plan.x),
                                   ("MLP outputs (residual stream rebuilt backwards)",
                                    getattr(plan, "rx", False))) if on]
-    tail = getattr(plan, "gu_tail", 0)
-    if tail:
-        kept.append(f"gate|up rows recomputed in the backward: last {tail} of {getattr(plan, 'n', '?')}")
     return ", ".join(kept) or "nothing (recompute)"
 
 

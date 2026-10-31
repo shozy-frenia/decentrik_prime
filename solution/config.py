@@ -44,6 +44,9 @@ OFFLOAD_CHECKPOINTS = True
 LOAD_TO_HOST = True
 # ... and convert the checkpoint's bf16 tensors to fp16 on the GPU instead of the CPU (bit-exact).
 LOAD_CONVERT_ON_GPU = True
+# ... and read the (tied) embedding straight into the page-locked buffer the LM head streams from,
+# in 8192-row blocks converted to fp16 on the GPU (never a whole table on the GPU, no CPU copy).
+EMBEDDING_DIRECT = True
 
 # ---------------------------------------------------------------------------- LM head
 # "chunks" = v6 streamed one-pass head over vocabulary chunks (works with a resident embedding
@@ -78,32 +81,9 @@ EARLY_RETIRE = True
 GU_SPLIT = 2
 # Instead of the fp32 layer input (6 KB/token/layer), keep the MLP output (fp16, 3 KB/token/layer)
 # and rebuild the residual stream backwards in the backward: x_i = (x_{i+1} - d_i) - o_i, from the
-# final hidden state down. v13: off. The v12 start-up self-test measured a max relative error of
-# 6.9e-3 (Qwen2.5's massive residual activations: undoing an addition in a channel where a later
-# layer is ~1e3 leaves an absolute error that is large next to the early layers' values), so it
-# switched the rebuild off in every run anyway, after the unused fp16 arena had been pinned.
-RECONSTRUCT_X = False
-# v13: the backward is PCIe-bound, not compute-bound (v12 timeline: a layer's host->GPU traffic,
-# 24.3 MB of 4-bit weights + 51 KB/token of saved activations, takes ~5.3 ms at ~12 GB/s for 767
-# tokens; the layer that needs no copy computes in 4.3 ms). The gate|up output is 35 of those
-# 51 KB/token, and its copy can only start once the previous layer's gate|up block is free. So
-# the last GU_RECOMPUTE_ROWS + GU_RECOMPUTE * N token rows of each layer's gate|up output
-# (rounded down to 16, at most N/3) are NOT copied to the host: the backward recomputes them
-# (norm 2 for those rows from x + o_proj, then the gate|up GEMM with the same row count as the
-# forward's last block, i.e. the same cuBLAS kernel) while the copy of the other rows is in
-# flight. Sized from the v12 timeline so that link time and compute time per backward layer meet:
-# link ~2.0 ms + 4.3 us/token, compute ~1.5 ms + 4.1 us/token; each recomputed row moves ~3 us
-# from the link to the compute (e.g. 112 of 853 rows). 0 and 0 = keep every row (v12). The
-# start-up self-test compares the recomputed rows with the forward's and switches this off on a
-# mismatch.
-GU_RECOMPUTE = 0.07
-GU_RECOMPUTE_ROWS = 64
-# v13: in the backward, queue the next-but-one layer's 4-bit weight copy at the start of a layer
-# (while the MLP backward runs and the link only carries the x / o_proj prefetch) instead of after
-# the MLP backward, where it competed for the link with the gate|up copy the next layer waits for.
-# The slot's previous layer had both halves queued for dequantisation one layer earlier; the
-# copy is ordered after them by events as before (dev/test_ws_schedule.py).
-BWD_WEIGHTS_EARLY = True
+# final hidden state down (exact up to one fp32 rounding per addition undone). Halves the
+# checkpoint traffic over PCIe in both directions and the pinned arena for it.
+RECONSTRUCT_X = False   # v12 self-test: 6.9e-3 max rel. error (massive activations), so off
 SAVE_ATTN = True
 HOST_CAPACITY = 2048
 
@@ -114,6 +94,18 @@ EARLY_PINNED = True
 # Unregister (unpin) our page-locked host buffers once the training loop is over, in a
 # background thread while Soup saves and wraps up (hostmem.release_async).
 EARLY_RELEASE = True
+
+# CUDA per-thread stack limit in bytes (0 = leave the default 1 KiB). The context reserves stack
+# x 1024 threads x 40 SMs of GPU memory for it (40 MiB at 1 KiB); the driver raises the limit by
+# itself for any kernel that needs more (cudactx.py).
+CUDA_STACK_BYTES = 16
+# cuBLAS workspace of 8 x 16 KiB per handle and stream (CUBLAS_WORKSPACE_CONFIG=:16:8) instead of
+# ~8 MiB. Off: not cleared with the organisers; it can also make some small GEMMs slower.
+CUBLAS_SMALL_WORKSPACE = False
+# Let HF Trainer's per-step walks over the model (model.parameters() in gradient clipping,
+# model.zero_grad()) use lists taken once at the start of training: same parameters in the same
+# order, and only the trainable ones can hold a gradient to clear (checked when installed).
+CACHED_TRAVERSALS = True
 
 # Before training (in the background build, while Soup builds the trainer): run the LM head
 # against an fp32 reference on a few random rows and one forward + backward of a small synthetic

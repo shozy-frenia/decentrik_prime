@@ -25,6 +25,13 @@ def apply():
     from . import config, integration, precompile, profile_setup
 
     profile_setup.start()        # where the time outside the training steps goes (log only)
+    if config.FAST_PATH and config.CUDA_STACK_BYTES:
+        from . import cudactx
+        integration._CTX["stack"] = cudactx.shrink_stack(int(config.CUDA_STACK_BYTES))
+    if config.FAST_PATH and config.CUBLAS_SMALL_WORKSPACE:
+        import os
+        # read by PyTorch when it creates the first cuBLAS workspace (no GEMM has run yet)
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
     if config.GC_TUNE:
         import gc
         # fewer cyclic-GC passes while Soup imports its stack and builds the run (every pass of

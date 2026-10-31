@@ -28,6 +28,7 @@ import threading
 import time
 
 _POOL = {}
+_READY = {}          # name -> threading.Event, set once that buffer of the pool exists
 _THREAD = [None]
 NOTE = {}
 _REG = []            # [uint8 tensor, mmap, registered] for every buffer we registered ourselves
@@ -118,6 +119,9 @@ def start(specs):
     except Exception:  # noqa: BLE001
         return
 
+    for name, _shape, _dtype in specs:
+        _READY[name] = threading.Event()
+
     def work():
         for name, shape, dtype in specs:
             started = time.perf_counter()
@@ -126,6 +130,7 @@ def start(specs):
             except Exception as exc:  # noqa: BLE001 - take() allocates (or the caller falls back)
                 _POOL[name] = exc
             NOTE[name] = round(time.perf_counter() - started, 3)
+            _READY[name].set()
 
     thread = threading.Thread(target=work, daemon=True, name="soup-pinned-pool")
     thread.start()
@@ -144,7 +149,9 @@ def take(name, shape, dtype):
     otherwise a newly allocated one (an allocation failure raises: callers fall back)."""
     import torch
 
-    wait()
+    ready = _READY.get(name)
+    if ready is not None:
+        ready.wait()                 # only this buffer (the embedding is taken while loading)
     t = _POOL.pop(name, None)
     if isinstance(t, torch.Tensor) and tuple(t.shape) == tuple(shape) and t.dtype == dtype:
         return t
