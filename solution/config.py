@@ -25,8 +25,21 @@ HEAD_CHUNK = 256
 # Scale applied to the fp16 head gradient (p - onehot) before the fp16 GEMM; undone in fp32.
 HEAD_GRAD_SCALE = 1024.0
 
-# Keep the per-layer residual checkpoints in pinned host memory instead of on the GPU
-# (copied out on a side stream during forward, prefetched one layer ahead during backward).
+# What the backward gets from the forward instead of recomputing it. Each is copied to a pinned
+# host arena on a copy stream while the forward computes the next layer, and copied back one
+# layer ahead in the backward (the copy engines run alongside the kernels; GPU memory only holds
+# the layers in flight):
+#   SAVE_GU   the gate|up GEMM output (35 KB/token/layer): saves the largest recomputed GEMM;
+#   SAVE_ATTN the post-RoPE QKV, the attention output and log-sum-exp, and the O GEMM output
+#             (10 KB/token/layer): saves norm-1 -> QKV GEMM -> epilogue -> attention -> O GEMM.
+# A batch with more tokens than HOST_CAPACITY (4 rows x 512 tokens is the task's maximum) is
+# recomputed instead, with the same result.
+SAVE_GU = True
+SAVE_ATTN = True
+HOST_CAPACITY = 2048
+
+# Keep the per-layer fp32 residual checkpoints (6 KB/token/layer) in a pinned host arena too,
+# instead of on the GPU.
 OFFLOAD_CHECKPOINTS = False
 
 # Keep the repacked 4-bit weights (680 MB) in pinned host memory and stream each layer into one of

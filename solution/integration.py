@@ -292,8 +292,20 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
         _log(f"step {runner.steps}: {batch.B} rows, {batch.n_real} tokens packed of {batch.B * batch.Tm} "
              f"({batch.n_lab} supervised), forward {time.perf_counter() - t0:.3f} s, "
              f"peak {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB, "
-             f"{runner.n_dequant} half-layer dequants so far")
+             f"{runner.n_dequant} half-layer dequants so far, kept from forward: "
+             f"{_plan_text(runner)}")
+        if runner.steps == 1:
+            _log(f"host arenas: {runner.host_note}")
     return loss
+
+
+def _plan_text(runner):
+    plan = getattr(runner, "last_plan", None)
+    if plan is None:
+        return "?"
+    kept = [name for name, on in (("gate|up", plan.gu), ("attention", plan.attn),
+                                  ("checkpoints on host", plan.x)) if on]
+    return ", ".join(kept) or "nothing (recompute)"
 
 
 # --------------------------------------------------------------------------- entry point

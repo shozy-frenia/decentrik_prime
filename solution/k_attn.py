@@ -280,6 +280,18 @@ def varlen_attention(qkv, cu, max_len, nq, nkv, hd, need_lse=False):
     return out, ctx
 
 
+def varlen_context(qkv, out, saved, nq, nkv, hd):
+    """The backward context of varlen_attention rebuilt from the forward's QKV buffer, output and
+    the kernel's (logsumexp, philox seed, philox offset), when those were kept from the forward
+    instead of recomputing the attention."""
+    n = qkv.shape[0]
+    g = nq // nkv
+    q = qkv[:, :nq * hd].view(1, n, nq, hd)
+    k = qkv[:, nq * hd:(nq + nkv) * hd].view(n, nkv, 1, hd).expand(n, nkv, g, hd).reshape(1, n, nq, hd)
+    v = qkv[:, (nq + nkv) * hd:].view(n, nkv, 1, hd).expand(n, nkv, g, hd).reshape(1, n, nq, hd)
+    return (q, k, v, out.view(1, n, nq, hd)) + tuple(saved)
+
+
 def varlen_attention_backward(ctx, dout, cu, max_len, nq, nkv, hd):
     """(dq [N, nq*hd], dk [N, nq*hd], dv [N, nq*hd]) fp16; dk/dv are per-query-head partials
     (6 per KV head) that the QKV epilogue backward sums (GIN = nq // nkv)."""

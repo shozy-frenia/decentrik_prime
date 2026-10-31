@@ -81,21 +81,23 @@ def qkv_epilogue_bwd_kernel(dq_ptr, dk_ptr, dv_ptr, pos_ptr, cos_ptr, sin_ptr, o
     d2 = tl.load(dq_ptr + src + o1 + HALF, mask=qm, other=0.0).to(tl.float32)
     tl.store(dst + o1, (d1 * c[None, :] + d2 * s[None, :]).to(tl.float16), mask=qm)
     tl.store(dst + o1 + HALF, (d2 * c[None, :] - d1 * s[None, :]).to(tl.float16), mask=qm)
-    # key heads: sum the partials of each KV head, then rotate back
+    # key / value heads: sum the GIN partials of each KV head (an unrolled loop of plain [NKV, *]
+    # loads: the earlier [NKV, GIN_P2, HALF] masked 3-D load + reduction was 5x slower than the
+    # bandwidth bound at GIN = 6), then rotate dk back
     skv = row * (NKV * GIN * HD)
     hk = tl.arange(0, NKV)
-    g = tl.arange(0, GIN_P2)
-    gm = (g < GIN)[None, :, None]
-    part = (hk[:, None, None] * GIN + g[None, :, None]) * HD + j[None, None, :]       # [NKV, G, HALF]
-    k1 = tl.sum(tl.load(dk_ptr + skv + part, mask=gm, other=0.0).to(tl.float32), axis=1)
-    k2 = tl.sum(tl.load(dk_ptr + skv + part + HALF, mask=gm, other=0.0).to(tl.float32), axis=1)
+    dvo = tl.arange(0, HD)
+    k1 = tl.zeros([NKV, HALF], tl.float32)
+    k2 = tl.zeros([NKV, HALF], tl.float32)
+    vsum = tl.zeros([NKV, HD], tl.float32)
+    for gi in tl.static_range(GIN):
+        part = skv + (hk[:, None] * GIN + gi) * HD
+        k1 += tl.load(dk_ptr + part + j[None, :]).to(tl.float32)
+        k2 += tl.load(dk_ptr + part + HALF + j[None, :]).to(tl.float32)
+        vsum += tl.load(dv_ptr + part + dvo[None, :]).to(tl.float32)
     ok = NQ * HD + hk[:, None] * HD + j[None, :]
     tl.store(dst + ok, (k1 * c[None, :] + k2 * s[None, :]).to(tl.float16))
     tl.store(dst + ok + HALF, (k2 * c[None, :] - k1 * s[None, :]).to(tl.float16))
-    # value heads: sum the partials
-    dvo = tl.arange(0, HD)
-    vpart = (hk[:, None, None] * GIN + g[None, :, None]) * HD + dvo[None, None, :]    # [NKV, G, HD]
-    vsum = tl.sum(tl.load(dv_ptr + skv + vpart, mask=gm, other=0.0).to(tl.float32), axis=1)
     ov = (NQ + NKV) * HD + hk[:, None] * HD + dvo[None, :]
     tl.store(dst + ov, vsum.to(tl.float16))
 

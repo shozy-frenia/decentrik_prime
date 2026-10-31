@@ -23,13 +23,15 @@ tokens. How it is computed changes:
 """
 
 import math
+import threading
+import time
 
 import torch
 
 from . import config
 from .k_attn import (_VARLEN_ERR, BWD_BLOCK, FWD_BLOCK_M, AttnMeta, attention_backward,
                      attention_forward, block_table, sdpa_attention, sdpa_attention_backward,
-                     varlen_attention, varlen_attention_backward, varlen_selftest)
+                     varlen_attention, varlen_attention_backward, varlen_context, varlen_selftest)
 from .k_head import fused_head
 from .k_mlp import gated_silu_backward, gated_silu_forward
 from .k_nf4 import (NF4_CODE, RANGE_ALIGN, WeightStreamer, dequant_layer, dequant_range,
@@ -250,8 +252,6 @@ class FastQwen2:
         self.one = torch.ones(1, dtype=torch.float32, device=dev)
         self.gen = torch.Generator(device="cpu")
         self.gen.manual_seed(int(seed) & 0x7FFFFFFF)
-        self.copy_stream = None
-        self.host_ckpt = None
         self.steps = 0
 
         # attention implementation: the varlen path is checked against the padded SDPA path on
@@ -267,10 +267,22 @@ class FastQwen2:
                 why = _VARLEN_ERR[-1] if _VARLEN_ERR else f"max rel. err {err}"
                 self.attn_note = f"padded sdpa (varlen self-test failed: {why})"
 
+        # Activations kept from the forward instead of recomputed in the backward (SAVE_GU,
+        # SAVE_ATTN) and the residual checkpoints (OFFLOAD_CHECKPOINTS) live in pinned host
+        # arenas, one row per layer: the forward copies them out on the copy stream while it
+        # computes the next layer, the backward copies them back one layer ahead. The arenas are
+        # allocated in a background thread now, while Soup builds the trainer.
+        self.copy_stream = torch.cuda.Stream(device=dev)
+        self.host, self.host_cap, self.host_note = {}, 0, "none"
+        self._host_thread = None
+        self.start_host_alloc(int(config.HOST_CAPACITY))
+
     @torch.no_grad()
     def restore_stock(self):
         """Undo what the fast path changed, for the stock forward: 4-bit weights back on the GPU (if
         they were moved to host memory) and the fp32 embedding the stock path expects."""
+        self._host_ready()
+        self.host, self.host_cap = {}, 0
         if self.streamer is not None:
             for i, linears in enumerate(self._linears):
                 self.packed[i], _ = repack_layer(linears, self.device, host=False)
@@ -410,13 +422,64 @@ class FastQwen2:
         batch.n_real = n
         return batch
 
-    # ------------------------------------------------------------------ checkpoint storage
-    def _store(self, n):
-        if config.OFFLOAD_CHECKPOINTS:
-            if self.copy_stream is None:
-                self.copy_stream = torch.cuda.Stream(device=self.device)
-            return _HostStore(self, n)
-        return _GpuStore()
+    # ------------------------------------------------------------------ activation storage
+    HOST_KINDS = ("x", "gu", "qkv", "out", "op")
+
+    def start_host_alloc(self, cap, kinds=None):
+        """Allocate the pinned host arenas (rows for layers 0..L-2; the last layer's tensors are
+        used right after the forward and stay on the GPU) in a background thread."""
+        self._host_ready()
+        if kinds is None:
+            kinds = set()
+            if config.OFFLOAD_CHECKPOINTS:
+                kinds.add("x")
+            if config.SAVE_GU:
+                kinds.add("gu")
+            if config.SAVE_ATTN:
+                kinds |= {"qkv", "out", "op"}
+        if self.attn_impl != "varlen":
+            kinds -= {"qkv", "out", "op"}
+        width = {"x": (self.D, torch.float32), "gu": (2 * self.I, torch.float16),
+                 "qkv": ((self.NQ + 2 * self.NKV) * self.HD, torch.float16),
+                 "out": (self.NQ * self.HD, torch.float16), "op": (self.D, torch.float16)}
+        kinds = sorted(k for k in kinds if k not in self.host)
+        if not kinds or cap <= 0:
+            return
+
+        def work():
+            started = time.perf_counter()
+            try:
+                made = {k: torch.empty((self.L - 1, cap, width[k][0]), dtype=width[k][1], pin_memory=True)
+                        for k in kinds}
+                self.host = dict(self.host, **made)
+                self.host_cap = cap if not self.host_cap else min(self.host_cap, cap)
+                gib = sum(t.numel() * t.element_size() for t in self.host.values()) / 2**30
+                self.host_note = (f"{gib:.2f} GiB pinned for {sorted(self.host)} "
+                                  f"({cap} tokens, {time.perf_counter() - started:.2f} s)")
+            except Exception as exc:  # noqa: BLE001 - the backward recomputes instead
+                self.host_note = f"host arenas unavailable ({type(exc).__name__}: {exc})"
+
+        self._host_thread = threading.Thread(target=work, daemon=True, name="soup-pinned")
+        self._host_thread.start()
+
+    def _host_ready(self):
+        if self._host_thread is not None:
+            self._host_thread.join()
+            self._host_thread = None
+
+    def _save_plan(self, n):
+        """Which activations go through the host arenas this step (a batch larger than the
+        arenas, or a missing arena, falls back to recomputation, which gives the same result)."""
+        self._host_ready()
+        fits = n <= self.host_cap
+        plan = _Plan()
+        plan.x = fits and config.OFFLOAD_CHECKPOINTS and "x" in self.host
+        plan.gu = fits and config.SAVE_GU and "gu" in self.host
+        plan.attn = (fits and config.SAVE_ATTN and self.attn_impl == "varlen"
+                     and all(k in self.host for k in ("qkv", "out", "op")))
+        plan.arenas = self.host
+        plan.last = self.L - 1
+        return plan
 
     # ------------------------------------------------------------------ one layer, forward part
     def _attn_part(self, i, x_norm, xq, xv, batch, grad=False):
@@ -472,7 +535,9 @@ class FastQwen2:
         if self.overlap:
             self.dq_stream.wait_stream(torch.cuda.current_stream(dev))
         seeds = self._seeds()
-        store = self._store(n)
+        plan = self._save_plan(n)
+        self.last_plan = plan
+        store = _ActStore(self, n)
         y = torch.empty((n, D), dtype=f16, device=dev)
         xq = torch.empty((n, D), dtype=f16, device=dev)
         xv = torch.empty((n, D), dtype=f16, device=dev)
@@ -491,15 +556,22 @@ class FastQwen2:
                             p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
                             seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
                 x = x_new
-            store.put(i, x)
+            store.retire(i - store.IN_FLIGHT)
+            store.put(i, "x", x, plan.x)
             nxt = i + 1 if i + 1 < self.L else None
             self._dequant(i, nxt)
             self._ws_use("attn", i)
-            qkv, _aq, _av, out, _actx = self._attn_part(i, y, xq, xv, batch)
-            del qkv, _aq, _av, _actx
+            qkv, _aq, _av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=plan.attn)
             op = torch.mm(out, self.W_o.t())
             self._ws_release("attn", nxt)
-            del out
+            if plan.attn:
+                # what the attention backward and the norm-2 backward need, so that the backward
+                # does not re-run norm-1 -> QKV GEMM -> epilogue -> attention -> O GEMM
+                store.put(i, "qkv", qkv, True)
+                store.put(i, "out", out, True)
+                store.put(i, "op", op, True)
+                store.put(i, "actx", actx[4:], False)       # logsumexp, philox seed/offset
+            del qkv, _aq, _av, out, actx
             h1 = torch.empty((n, D), dtype=f32, device=dev)
             rms_forward(x, self.w_post[i], y2, rstd, self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
@@ -508,12 +580,15 @@ class FastQwen2:
             gu = torch.mm(y2, self.W_gu.t())
             act = torch.empty((n, self.I), dtype=f16, device=dev)
             gated_silu_forward(gu, act)
+            if plan.gu:
+                store.put(i, "gu", gu, True)        # the backward reads it instead of a gate|up GEMM
             del gu
             d16 = torch.mm(act, self.W_d.t())
             self._ws_release("mlp", nxt)
             del act
             x = h1
         del y, xq, xv, y2
+        store.retire(self.L)
         hf = torch.empty((n, D), dtype=f32, device=dev)
         yf = torch.empty((n, D), dtype=f16, device=dev)
         rstd_f = torch.empty(n, dtype=f32, device=dev)
@@ -523,7 +598,8 @@ class FastQwen2:
         loss_sum, stats, dy_head = self._head(yf, batch)
         del yf
         self.steps += 1
-        saved = dict(store=store, hf=hf, rstd_f=rstd_f, dy_head=dy_head, seeds=seeds, batch=batch)
+        saved = dict(store=store, plan=plan, hf=hf, rstd_f=rstd_f, dy_head=dy_head, seeds=seeds,
+                     batch=batch)
         return loss_sum, stats, saved
 
     def _head(self, yf, batch):
@@ -532,7 +608,7 @@ class FastQwen2:
 
     # ------------------------------------------------------------------ backward
     def backward(self, saved, g_loss):
-        batch, store, seeds = saved["batch"], saved["store"], saved["seeds"]
+        batch, store, seeds, plan = saved["batch"], saved["store"], saved["seeds"], saved["plan"]
         n, D = batch.n, self.D
         dev = self.device
         f16, f32 = torch.float16, torch.float32
@@ -549,27 +625,32 @@ class FastQwen2:
         rstd2 = torch.empty(n, dtype=f32, device=dev)
         grads = [None] * len(self.lora_params)
         s = self.lora_scale
-        store.prefetch(self.L - 1)
         for i in reversed(range(self.L)):
-            x = store.get(i)
+            x = store.get(i, "x")
             if i > 0:
-                store.prefetch(i - 1)
+                store.prefetch(i - 1, "x")
+                store.prefetch(i - 1, "op")
             aq16, bq16, av16, bv16 = self.lora16[4 * i:4 * i + 4]
             prv = i - 1 if i > 0 else None
             self._dequant(i, prv)
-            # recompute the layer's forward from its checkpoint
+            # norm 1 again: the dropout-masked LoRA inputs (same Philox seeds) and rstd
             rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv, p_drop=self.p_drop,
                         keep_scale=self.keep_scale, seed_q=seeds[2 * i], seed_v=seeds[2 * i + 1],
                         dummy16=self.dummy16, dummy32=self.dummy32)
-            self._ws_use("attn", i)
-            qkv, aq, av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=True)
-            op = torch.mm(out, self.W_o.t())
+            if plan.attn:
+                aq = torch.mm(xq, aq16.t())
+                av = torch.mm(xv, av16.t())
+                op = store.get(i, "op")
+            else:
+                self._ws_use("attn", i)
+                qkv, aq, av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=True)
+                op = torch.mm(out, self.W_o.t())
             h1 = torch.empty((n, D), dtype=f32, device=dev)
             rms_forward(x, self.w_post[i], y2, rstd2, self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
             del op
             self._ws_use("mlp", i)
-            gu = torch.mm(y2, self.W_gu.t())
+            gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())
             # MLP backward
             dact = torch.mm(dh16, self.W_d)
             gated_silu_backward(gu, dact)
@@ -577,17 +658,29 @@ class FastQwen2:
             dy2 = torch.mm(gu, self.W_gu)
             self._ws_release("mlp", prv)        # layer i-1's MLP weights dequantise under the attention backward
             del gu
+            if plan.gu and i > 0:
+                store.prefetch(i - 1, "gu")     # into the block gu just released
             rms_backward(dy2, self.one, h1, self.w_post[i], rstd2, dh, dres=dh, out16=dh16,
                          dummy16=self.dummy16, dummy32=self.dummy32)
             del dy2, h1
             # attention backward
+            if plan.attn:
+                self._ws_use("attn", i)
             dout = torch.mm(dh16, self.W_o)
+            if plan.attn:
+                qkv = store.get(i, "qkv")
+                out = store.get(i, "out")
+                actx = varlen_context(qkv, out, store.get(i, "actx"), self.NQ, self.NKV, self.HD)
             dq, dk, dv, gin = self._attention_backward(qkv, out, actx, dout, batch)
             del out, actx, dout
             qkv_epilogue_backward(dq, dk, dv, batch.pos, self.cos, self.sin, qkv,
                                   self.NQ, self.NKV, self.HD, gin)
             del dq, dk, dv
-            dy1 = torch.mm(qkv, self.W_qkv)
+            if plan.attn and i > 0:
+                store.prefetch(i - 1, "qkv")
+                store.prefetch(i - 1, "out")
+            # layer 0: nothing below needs d(input), only its LoRA gradients
+            dy1 = torch.mm(qkv, self.W_qkv) if i > 0 else None
             self._ws_release("attn", prv)
             gq = qkv[:, :self.NQ * self.HD]
             gv = qkv[:, (self.NQ + self.NKV) * self.HD:]
@@ -595,18 +688,18 @@ class FastQwen2:
             d_bq = torch.mm(gq.t(), aq).float().mul_(s)
             daq = torch.mm(gq, bq16).mul_(s)
             d_aq = torch.mm(daq.t(), xq).float()
-            lqx = torch.mm(daq, aq16)
             d_bv = torch.mm(gv.t(), av).float().mul_(s)
             dav = torch.mm(gv, bv16).mul_(s)
             d_av = torch.mm(dav.t(), xv).float()
-            lvx = torch.mm(dav, av16)
-            del qkv, gq, gv, aq, av, daq, dav
-            rms_backward(dy1, self.one, x, self.w_in[i], rstd1, dh, dres=dh, lq=lqx, lv=lvx,
-                         p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
-                         seed_v=seeds[2 * i + 1], out16=dh16 if i > 0 else None,
-                         dummy16=self.dummy16, dummy32=self.dummy32)
-            del dy1, lqx, lvx, x
-            store.drop(i)
+            if i > 0:
+                lqx = torch.mm(daq, aq16)
+                lvx = torch.mm(dav, av16)
+                rms_backward(dy1, self.one, x, self.w_in[i], rstd1, dh, dres=dh, lq=lqx, lv=lvx,
+                             p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
+                             seed_v=seeds[2 * i + 1], out16=dh16, dummy16=self.dummy16,
+                             dummy32=self.dummy32)
+                del lqx, lvx
+            del qkv, gq, gv, aq, av, daq, dav, dy1, x
             grads[4 * i:4 * i + 4] = [d_aq, d_bq, d_av, d_bv]
         store.close()
         return grads
@@ -616,82 +709,96 @@ class _Batch:
     pass
 
 
-class _GpuStore:
-    def __init__(self):
-        self.t = {}
-
-    def put(self, i, x):
-        self.t[i] = x
-
-    def prefetch(self, i):
-        pass
-
-    def get(self, i):
-        return self.t[i]
-
-    def drop(self, i):
-        self.t.pop(i, None)
-
-    def close(self):
-        self.t.clear()
+class _Plan:
+    """Per-step choice of what the forward keeps for the backward (see FastQwen2._save_plan)."""
+    x = gu = attn = False
+    arenas = None
+    last = 0
 
 
-class _HostStore:
-    """Residual checkpoints in pinned host memory: D2H on a side stream during forward, H2D one
-    layer ahead during backward. Stream order: the side stream waits for the producer on the main
-    stream; the main stream waits for the copy before it reads a prefetched tensor; record_stream
-    keeps the allocator from reusing a source buffer while a copy still reads it."""
+class _ActStore:
+    """Per-layer tensors the backward needs from the forward.
+
+    put(i, kind, t, host): keep t on the GPU, or (host=True, an arena exists for `kind`, and i is
+    not the last layer) copy it into row i of the pinned host arena on the copy stream, which
+    first waits for the main stream (so t is complete).
+    retire(i): called at the start of forward layer i; the main stream waits for the copies of
+    layer i - IN_FLIGHT and only then are their source tensors released. The order matters: the
+    caching allocator hands a freed block to the next allocation on the main stream right away,
+    so the GPU-side wait must be enqueued before the release. (record_stream would instead keep a
+    block pending until its copy is done *when the CPU allocates*, and the CPU runs many layers
+    ahead of the GPU: every layer would get a fresh block.) A slow copy therefore stalls the main
+    stream two layers later instead of growing memory.
+    prefetch(i, kind): allocate the GPU tensor on the main stream (usually the block that was
+    just released) and start the host-to-device copy on the copy stream once the main stream has
+    reached that point, i.e. after every queued kernel that read the old contents of the block.
+    get(i, kind): the GPU tensor; the main stream waits for its copy. The copy stream is one FIFO
+    for both directions, so a host row is never read before it is written, and the next step's
+    forward never overwrites a row before this step's backward has read it.
+    """
+
+    IN_FLIGHT = 2
 
     def __init__(self, model, n):
         self.m, self.n = model, n
-        rows = max(n, 2048)
-        if model.host_ckpt is None or model.host_ckpt.shape[1] < rows:
-            model.host_ckpt = torch.empty((model.L, rows, model.D), dtype=torch.float32, pin_memory=True)
-        self.host = model.host_ckpt
         self.side = model.copy_stream
-        self.out_ev, self.pending = {}, {}
+        self.gpu, self.pending, self.where, self.inflight = {}, {}, {}, {}
 
-    def put(self, i, x):
+    def put(self, i, kind, t, host):
+        arena = self.m.host.get(kind) if host and i < self.m.L - 1 else None
+        if arena is None:
+            self.gpu[(i, kind)] = t
+            return
         main = torch.cuda.current_stream(self.m.device)
         ready = torch.cuda.Event()
         ready.record(main)
         with torch.cuda.stream(self.side):
             self.side.wait_event(ready)
-            self.host[i, :self.n].copy_(x, non_blocking=True)
-            x.record_stream(self.side)
+            arena[i, :self.n].copy_(t, non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.side)
-        self.out_ev[i] = done
+        self.inflight.setdefault(i, []).append((t, done))
+        self.where[(i, kind)] = (arena, t.dtype, tuple(t.shape))
 
-    def prefetch(self, i):
-        if i in self.pending:
-            return
+    def retire(self, upto):
+        """Main stream waits for the copies of layers <= upto, then their sources are released."""
         main = torch.cuda.current_stream(self.m.device)
-        g = torch.empty((self.n, self.m.D), dtype=torch.float32, device=self.m.device)
+        for j in sorted(k for k in self.inflight if k <= upto):
+            for _t, done in self.inflight[j]:
+                main.wait_event(done)
+            del self.inflight[j]
+
+    def prefetch(self, i, kind):
+        key = (i, kind)
+        if key in self.gpu or key in self.pending or key not in self.where:
+            return
+        arena, dtype, shape = self.where.pop(key)
+        main = torch.cuda.current_stream(self.m.device)
+        g = torch.empty(shape, dtype=dtype, device=self.m.device)
         ready = torch.cuda.Event()
-        ready.record(main)                      # g's allocation is ordered on main
+        ready.record(main)
         with torch.cuda.stream(self.side):
             self.side.wait_event(ready)
-            self.side.wait_event(self.out_ev[i])
-            g.copy_(self.host[i, :self.n], non_blocking=True)
-            g.record_stream(self.side)
+            g.copy_(arena[i, :self.n], non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.side)
-        self.pending[i] = (g, done)
+        self.pending[key] = (g, done)
 
-    def get(self, i):
-        if i not in self.pending:
-            self.prefetch(i)
-        g, done = self.pending.pop(i)
+    def get(self, i, kind):
+        key = (i, kind)
+        if key in self.gpu:
+            return self.gpu.pop(key)
+        if key not in self.pending:
+            self.prefetch(i, kind)
+        g, done = self.pending.pop(key)
         torch.cuda.current_stream(self.m.device).wait_event(done)
         return g
 
-    def drop(self, i):
-        pass
-
     def close(self):
-        # the next step's D2H into the same host rows is ordered after this point on main
+        self.retire(10 ** 9)
+        self.gpu.clear()
         self.pending.clear()
+        self.where.clear()
 
 
 class FusedCausalLM(torch.autograd.Function):
