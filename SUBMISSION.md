@@ -67,5 +67,5 @@ memory, quality), limits and next steps.
   memory-efficient attention; our kernels do the memory-bound work.
 - LoRA dropout masks come from our Philox stream, not PyTorch's: same distribution, not the same
   draw, so the loss curve matches the base within tolerance but not bit for bit after step 1.
-- v6 (the streamed placement) has not been measured on a T4 yet; fill the tables above from the
-  notebook run, not from the README's estimates.
+- v6/v7 (the streamed placement, the trimmed backward) have not been measured on a T4 yet; fill
+  the tables above from the notebook run, not from the README's estimates.

@@ -40,12 +40,47 @@ Each row is a measured run, except where marked *pending*.
 | v4 | varlen attention (`cu_seqlens`, no padding), dequant on a side stream, launchers built ahead | 51.98 | 27.97 | 0.420 | 1815 | 2.0495 |
 | v5 | gate\|up and attention activations kept in pinned host memory instead of recomputed | 51.83 | 26.22 | 0.393 | 1939 | 2.0495 |
 | v6 | model streamed from host memory (weights, embedding, checkpoints), loaded off the GPU, streamed vocabulary-chunk LM head, no sync between forward and backward | *pending* | | | | |
+| v7 | v6 + backward without the norm-2 recompute and without recomputing the LoRA-A projections, lighter norm-1 recompute, GC tuning, start-up self-test with fallback, setup profiler | *pending* | | | | |
 
 v5 measured profile (per step, `--profile`, GPU time with overlaps): cuBLAS GEMMs ≈ 276 ms,
 pinned↔GPU copies 79 + 74 ms (on the copy engines, overlapped), our dequant 33 ms (side stream),
 attention 25 ms, our norms 18 ms, SwiGLU 13 ms, head 5 ms. In-process A/B of v5 on the same
 batches: keeping activations instead of recomputing −99 ms/step; residual checkpoints on the host
 −189 MiB for +11 ms/step.
+
+## v7: where the step time goes, and what was cut
+
+The v5 profile (per step, from the log) splits the GPU time as: cuBLAS GEMMs ≈ 265 ms (forward
+TN ≈ 130, backward NN ≈ 135 — the `256x128 nn` kernel alone is 113 ms), our dequant 33 ms (side
+stream), attention 25 ms, `rms_fwd` 11.6 ms over 113 launches, `gated_silu` 12.8 ms, `rms_bwd`
+6.5 ms, rank-16 LoRA GEMMs ≈ 8 ms, small copies ≈ 4.5 ms. The GEMMs carry the fixed FLOPs of the
+task (≈ 6 GFLOP per token: forward, backward through every frozen weight, and the 151,936-row
+head), so v7 removes work around them:
+
+* **No norm-2 recompute in the backward.** With the gate|up output kept, nothing of norm 2 has to
+  be recomputed: the forward keeps norm 2's `rstd` per layer (4 bytes per token) and
+  `rms_bwd_kernel` rebuilds the norm input `x + o_proj` in registers, exactly as the forward
+  computed it (bit-identical, emulator- and GPU-tested). 28 launches and ~15 KB per token per layer
+  of memory traffic fewer per step.
+* **No LoRA-A recompute.** The rank-16 projections `x_q·A_qᵀ`, `x_v·A_vᵀ` (64 bytes per token per
+  layer) stay on the GPU from the forward: 56 tiny GEMMs fewer per step.
+* **Lighter norm-1 recompute.** When the attention activations were kept, the backward's norm-1
+  pass writes only rstd and the two dropout-masked LoRA inputs, not the GEMM input it no longer needs.
+* **Python GC.** A higher generation-0 threshold while Soup builds the run and `gc.freeze()` at
+  the first step (full GC passes walk millions of objects); the per-phase GC time is logged.
+* **Measurement for the rest** (`solution/profile_setup.py`, log only): about half of the 51.8 s
+  of v5 was outside the 64 steps (harness start ≈ 5 s, imports ≈ 5 s, Soup's data preparation
+  ≈ 5 s, model load ≈ 3 s, trainer construction ≈ 4 s, save and exit ≈ 3.5 s). A sampling
+  profiler of the main thread prints where those seconds go (inclusive and self frames, per
+  phase), and `dev/check_fast_path.py` now measures the step's GEMM shapes at sustained clocks
+  (cuBLAS vs cuBLASLt, split-K for the two small-output GEMMs) and A/B-tests `BLAS_LT`.
+
+Considered and not done: concatenating the q and v LoRA-A GEMMs into one rank-32 GEMM (PEFT
+draws an independent dropout mask for each, so their inputs differ); a binary-tree NF4 lookup
+(our kernel reads the 16-entry table from L1 and runs at ~75 % of the T4's write bandwidth);
+skipping layer 0's QKV dequantisation in the backward (the next forward reuses that workspace);
+sizing the activation arenas below the task's maximum batch (a longer batch would silently take
+the slower recompute path).
 
 ## Where the memory was, and where it goes now
 
@@ -88,7 +123,7 @@ starts the backward from the workspace, and the slots still hold the layer befor
 | `head_finalize_kernel` (v6) | `k_head.py` | — | Per row: `lse`, entropy `log s − t/s`, loss `lse − x_t`, accuracy hit, and `d(hidden) = acc/(1024 s) + (p_t−1)·E_t` written straight into token order. The target term is added in fp32 from the gathered row `E_t`, not through the fp16 `P` matrix: for a confident prediction the gradient is a small difference of two nearly equal vectors. |
 | `nf4_layer_dequant_kernel` | `k_nf4.py` | 7× bitsandbytes `dequantize_4bit` per layer per pass | At setup the 7 NF4 weights of a layer are repacked into one buffer `[nibbles \| absmax codes \| 2nd-level scales \| offsets]` (in pinned host memory in v6). One launch per layer half (attention part, MLP part) decodes `fp16(NF4[nibble] · (code2[q]·absmax2 + offset))` for 8192 weights per program (`tl.join` interleaves the two nibbles of a byte), writing the fused Q\|K\|V, O, gate\|up, down matrices. Launched with FMA fusion off: bit-exact vs bitsandbytes. |
 | `rms_fwd_kernel` | `k_norm.py` | Qwen2RMSNorm (fp32, ~6 kernels) + residual add + PEFT's two `lora_dropout` + autocast casts | One program per token: `x = x_prev + delta`, `rstd`, `y = w·(x·rstd)`, writes the fp32 residual (the layer checkpoint), fp16 `y` for the GEMMs and both dropout-masked LoRA inputs. Masks come from Philox (`tl.rand`) keyed by token×column, so backward regenerates them instead of storing them. |
-| `rms_bwd_kernel` | `k_norm.py` | autograd of the above + dropout backward + residual-grad accumulation | `dx = rstd·(g − x̂·mean(g·x̂))`, `g = w·(dy + mask_q·dLoRA_q + mask_v·dLoRA_v)`, accumulated in place into the fp32 residual gradient. |
+| `rms_bwd_kernel` | `k_norm.py` | autograd of the above + dropout backward + residual-grad accumulation | `dx = rstd·(g − x̂·mean(g·x̂))`, `g = w·(dy + mask_q·dLoRA_q + mask_v·dLoRA_v)`, accumulated in place into the fp32 residual gradient. v7: the norm input can be given as `x + delta` and is rebuilt in registers (no recomputed copy), with the forward's rstd. |
 | `qkv_epilogue_fwd_kernel` | `k_rope.py` | PEFT's LoRA add for q/v, `apply_rotary_pos_emb` (`rotate_half`, `cat`), the fp16 casts for SDPA | In place on the fused QKV GEMM output: `q += 2·lora_q`, rotate q and k with the model's cos/sin, `v += 2·lora_v`. |
 | `qkv_epilogue_bwd_kernel` | `k_rope.py` | RoPE backward + GQA reduction | Transposed rotation, summing the 6 per-query-head dK/dV partials of each KV head, writes the fp16 grad of the fused QKV output. |
 | `gated_silu_fwd_kernel`, `gated_silu_bwd_kernel` | `k_mlp.py` | `act_fn(gate) * up` in fp32 + its autograd | Works on the fused `[gate \| up]` GEMM output; the backward overwrites it in place with `[d gate \| d up]`, so the fused weight-grad GEMM reads one buffer and no extra `[N, 17920]` tensor exists. |
@@ -202,7 +237,7 @@ starts the backward from the workspace, and the slots still hold the layer befor
 | Same task | model, data, batch order (the trainer's sampler/collator are untouched), steps, LoRA r/alpha/dropout/targets and init, optimizer, schedule, loss. The model is the same tensors: bitsandbytes quantises every weight on the GPU exactly as in the base; we only change where the results are stored (host memory), which the dev check verifies bit for bit |
 | Same Soup outputs | the metrics and rewind records are computed as TRL/Soup do and recorded within the same step, before the trainer logs |
 | Soup's built-in modes | untouched: `gradient_checkpointing`, `activation_offloading`, `stream_layers`, `packing`, `use_cut_ce`, `fast_lora` stay off; the offloading, streaming, recomputation and padding removal are our own code inside our forward/backward |
-| Clean measurement | no CUDA graphs, no extra processes (background *threads* of the measured process only: compilation, pinned allocation, the model repack and the start-up self-test), no caches, the harness's allocator settings unchanged; behaviour does not depend on being measured or tested (the self-test and its fallbacks run identically in every run) |
+| Clean measurement | no CUDA graphs, no extra processes (background *threads* of the measured process only: compilation, pinned allocation, the model repack, the start-up self-test and the log-only setup profiler), no caches, the harness's allocator settings unchanged; behaviour does not depend on being measured or tested (the self-test and its fallbacks run identically in every run) |
 | Soup's tests | patches are guarded (fake modules in the tests never qualify), loading patches are pass-through unless the fast plan is active |
 
 ## How to run
@@ -230,7 +265,8 @@ Switches are constants in `solution/config.py`: what lives in host memory (`OFFL
 `RESIDENT_LAYERS`, `OFFLOAD_EMBEDDING`, `OFFLOAD_CHECKPOINTS`, `LOAD_TO_HOST`), the head
 (`HEAD_IMPL`, `HEAD_VOCAB_CHUNK`, `HEAD_RING`), which activations are kept, background
 compilation/allocation, deferred metrics, the start-up self-test (`SELF_TEST`,
-`FALLBACK_RESIDENT`). Setting `OFFLOAD_WEIGHTS`, `OFFLOAD_EMBEDDING`, `OFFLOAD_CHECKPOINTS` and
+`FALLBACK_RESIDENT`), `GC_TUNE`, `SETUP_PROFILE` (log only; switch off for the final measured run),
+`BLAS_LT` (experimental). Setting `OFFLOAD_WEIGHTS`, `OFFLOAD_EMBEDDING`, `OFFLOAD_CHECKPOINTS` and
 `LOAD_TO_HOST` to False and `HEAD_IMPL="rows"` gives the measured v5 layout.
 
 ## Limitations, what did not work, next steps
