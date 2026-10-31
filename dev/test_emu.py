@@ -344,8 +344,125 @@ def test_head():
     check("stats-only leaves logits", lg2, logits[:2], 0)
 
 
+def _head_chunks_case(V, N, D, CH, n_valid_rows, seed, plant_tie=True, label=""):
+    """Drive head_chunk_kernel / head_finalize_kernel exactly like k_head.streamed_head does (the
+    two GEMMs per chunk done here in fp32 with an fp16 logits output, like cuBLAS), against a
+    float64 reference on the full fp16 logits."""
+    r = np.random.default_rng(seed)
+    E = (r.standard_normal((V, D)) * 0.5).astype(f16)
+    Y = (r.standard_normal((N, D)) * 0.8).astype(f16)
+    tgt = r.integers(0, V, N).astype(np.int64)
+    invalid = r.permutation(N)[: N - n_valid_rows]
+    tgt[invalid] = -1
+    if plant_tie and N > 1 and V > 2000:
+        # rows 5 and 2000 of E identical, token 1 aligned with them: its max logit ties across two
+        # different vocabulary chunks -> the first index must win
+        E[2000] = E[5]
+        Y[1] = (E[5].astype(f32) * 6.0).astype(f16)
+        tgt[1] = 2000
+    valid = tgt >= 0
+    perm = np.concatenate([np.nonzero(valid)[0], np.nonzero(~valid)[0]]).astype(np.int32)
+    n_lab = int(valid.sum())
+    ys = Y[perm]
+    tgt_sorted = tgt[perm].astype(np.int32)
+    state = np.zeros((N, 8), f32)
+    state[:, 0] = -np.inf
+    acc = np.zeros((max(n_lab, 1), D), f32)
+    n_chunks = -(-V // CH)
+    for c in range(n_chunks):
+        v0 = c * CH
+        vc = min(CH, V - v0)
+        ec = E[v0:v0 + vc]
+        lg = (ys.astype(f32) @ ec.astype(f32).T).astype(f16)
+        k_head.head_chunk_kernel[(N,)](lg, tgt_sorted, state, acc, N, n_lab, vc, v0, 1024.0,
+                                       D=D, BLOCK_V=256, BLOCK_D=tri.next_power_of_2(D))
+        if n_lab:
+            acc[:n_lab] += lg[:n_lab].astype(f32) @ ec.astype(f32)
+    stats = np.zeros((N, 4), f32)
+    dy = np.full((N, D), np.nan, f16)
+    et = E[np.maximum(tgt_sorted[:max(n_lab, 1)], 0)]
+    k_head.head_finalize_kernel[(N,)](state, tgt_sorted, perm, acc, et, stats, dy, N, n_lab,
+                                      1024.0, 1.0 / 1024.0, D=D, BLOCK_D=tri.next_power_of_2(D))
+    full = (ys.astype(f32) @ E.astype(f32).T).astype(f16).astype(np.float64)
+    m = full.max(1, keepdims=True)
+    lse = (m + np.log(np.exp(full - m).sum(1, keepdims=True)))[:, 0]
+    p = np.exp(full - lse[:, None])
+    ent = -(p * np.log(p)).sum(1)
+    am = full.argmax(1)
+    t = tgt_sorted.astype(np.int64)
+    ok = t >= 0
+    loss = np.where(ok, lse - full[np.arange(N), np.maximum(t, 0)], 0.0)
+    hit = np.where(ok & (am == t), 1.0, 0.0)
+    check(f"{label}loss", stats[:, 0], loss, 2e-4, 1e-5)
+    check(f"{label}entropy", stats[:, 1], ent, 2e-4, 1e-4)
+    check(f"{label}hit (first index across chunks)", stats[:, 2], hit, 0)
+    check(f"{label}lse", stats[:, 3], lse, 2e-4, 1e-6)
+    onehot = np.zeros_like(p)
+    onehot[np.arange(N)[ok], t[ok]] = 1.0
+    g_sorted = (p - onehot) @ E.astype(np.float64) * 1024.0
+    g_sorted[~ok] = 0.0
+    ref = np.zeros((N, D))
+    ref[perm] = g_sorted
+    check(f"{label}d(hidden) x1024, token order", dy.astype(np.float64), ref, 2e-2, 3e-3)
+    if plant_tie and N > 1 and V > 2000:
+        row1 = int(np.nonzero(perm == 1)[0][0])
+        check(f"{label}planted tie -> index 5", [stats[row1, 2]], [0.0], 0)
+
+
+def test_head_chunks():
+    print("lm head over vocabulary chunks (online softmax, gradient accumulated in the pass)")
+    _head_chunks_case(2600, 9, 48, 512, 6, 11, label="")
+    _head_chunks_case(2600, 5, 48, 512, 0, 12, plant_tie=False, label="no targets: ")
+    _head_chunks_case(1000, 4, 40, 1000, 4, 13, plant_tie=False, label="one chunk: ")
+    # confident predictions: p_t -> 1, the gradient is a small difference (target term in fp32)
+    r = np.random.default_rng(14)
+    V, N, D, CH = 1500, 6, 32, 256
+    E = (r.standard_normal((V, D)) * 0.3).astype(f16)
+    tgt = r.integers(0, V, N).astype(np.int32)
+    Y = (E[tgt].astype(f32) * 6.0).astype(f16)       # p_t between 0.87 and 0.99998
+    perm = np.arange(N, dtype=np.int32)
+    state = np.zeros((N, 8), f32)
+    state[:, 0] = -np.inf
+    acc = np.zeros((N, D), f32)
+    for c in range(-(-V // CH)):
+        v0, vc = c * CH, min(CH, V - c * CH)
+        ec = E[v0:v0 + vc]
+        lg = (Y.astype(f32) @ ec.astype(f32).T).astype(f16)
+        k_head.head_chunk_kernel[(N,)](lg, tgt, state, acc, N, N, vc, v0, 1024.0, D=D, BLOCK_V=128,
+                                       BLOCK_D=32)
+        acc += lg.astype(f32) @ ec.astype(f32)
+    stats = np.zeros((N, 4), f32)
+    dy = np.zeros((N, D), f16)
+    k_head.head_finalize_kernel[(N,)](state, tgt, perm, acc, E[tgt], stats, dy, N, N, 1024.0,
+                                      1.0 / 1024.0, D=D, BLOCK_D=32)
+    full16 = (Y.astype(f32) @ E.astype(f32).T).astype(f16)
+    full = full16.astype(np.float64)
+    m = full.max(1, keepdims=True)
+    p = np.exp(full - m)
+    p /= p.sum(1, keepdims=True)
+    oh = np.zeros_like(p)
+    oh[np.arange(N), tgt] = 1.0
+    g = (p - oh) @ E.astype(np.float64) * 1024.0
+    # What the base computes for the same rows: fp32 log-softmax gradient, cast to fp16 under the
+    # GradScaler's scale (65536 / ~500 supervised tokens) for the fp16 lm_head GEMM backward. For a
+    # very confident row (p_t = 0.99998) the fp32 p_t - 1 alone is off by a few percent, in the base
+    # as here; the streamed head must be no less precise than that, row by row.
+    x32 = full16.astype(f32)
+    mx = x32.max(1, keepdims=True)
+    lse32 = mx + np.log(np.exp(x32 - mx).sum(1, keepdims=True, dtype=f32))
+    gl32 = (np.exp(x32 - lse32) - oh.astype(f32)).astype(f32)
+    sc = f32(65536 / 500.0)
+    base = ((gl32 * sc).astype(f16).astype(f32) @ E.astype(f32)).astype(np.float64) / float(sc) * 1024.0
+    rel = np.abs(dy.astype(np.float64) - g).max(1) / np.abs(g).max(1)
+    rel_base = np.abs(base - g).max(1) / np.abs(g).max(1)
+    print(f"    (p_t {np.array2string(p[np.arange(N), tgt], precision=5)}; relative error ours "
+          f"{np.array2string(rel, precision=4)}, base {np.array2string(rel_base, precision=4)})")
+    check("confident rows: d(hidden) no less precise than the base", rel,
+          np.zeros(N), 1e-3 + 1.5 * rel_base)
+
+
 if __name__ == "__main__":
-    for fn in (test_nf4, test_norm, test_rope, test_attention, test_mlp, test_head):
+    for fn in (test_nf4, test_norm, test_rope, test_attention, test_mlp, test_head, test_head_chunks):
         fn()
     print("\nFAILED: " + ", ".join(FAIL) if FAIL else "\nALL EMULATED KERNEL CHECKS PASSED")
     sys.exit(1 if FAIL else 0)
