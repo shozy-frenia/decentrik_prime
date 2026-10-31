@@ -352,6 +352,17 @@ def _build_runner(wrapper, cfg, tcfg):
         _restore_quietly(model)
         return None
     runner._t_build = started
+    # transformers 5 sets no hf_device_map for a single-device load, so accelerate's prepare_model
+    # would call model.to("cuda") and copy the host-resident 4-bit weights and the embedding to
+    # the GPU (+1.07 GB of unused duplicates in the v6 run). The map is the documented marker of
+    # a model that manages its own placement (Soup's layer-stream runtime sets it the same way).
+    try:
+        base = model.get_base_model()
+        if getattr(base, "hf_device_map", None) is None:
+            index = runner.device.index
+            base.hf_device_map = {"": torch.cuda.current_device() if index is None else int(index)}
+    except Exception as exc:  # noqa: BLE001 - the first-step check still reclaims the copies
+        _log(f"hf_device_map not set: {type(exc).__name__}: {exc}")
     _log(f"fast path validated in {time.perf_counter() - started:.2f} s; placement and repacking "
          f"continue in the background while Soup builds the trainer")
     return runner
@@ -423,9 +434,14 @@ def _install_on_trainer(trainer, runner):
 
         class _Timeline(transformers.TrainerCallback):
             def on_train_end(self, args, state, control, **kwargs):
-                from . import profile_setup
+                from . import hostmem, profile_setup
                 _log("training loop done")
                 profile_setup.phase("wrapup")
+                if config.EARLY_RELEASE:
+                    try:
+                        hostmem.release_async(runner.device)   # unpin while Soup wraps up
+                    except Exception:  # noqa: BLE001
+                        pass
 
         trainer.add_callback(_Timeline())
         orig_save = trainer.save_model
@@ -487,7 +503,16 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
         if config.GC_TUNE:
             import gc
             gc.freeze()                   # setup's objects never get scanned again by the GC
-        _log("first step starts")
+        try:
+            freed = runner.reclaim_gpu_copies()
+            if freed:
+                _log(f"model weights had been copied to the GPU ({freed:.0f} MiB); moved back to "
+                     f"the host buffers and freed")
+        except Exception as exc:  # noqa: BLE001
+            _log(f"placement check failed: {type(exc).__name__}: {exc}")
+        from . import hostmem
+        _log(f"first step starts (GPU {torch.cuda.memory_allocated() / 2**20:.0f} MiB allocated; "
+             f"host buffers: {hostmem.describe()})")
     batch = runner.pack(inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
     if batch is None:
         return _stock_compute_loss(self, model, inputs, return_outputs, num_items_in_batch)

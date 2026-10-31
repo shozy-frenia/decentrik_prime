@@ -345,6 +345,7 @@ class FastQwen2:
                 host_all = None
                 self.notes.append(f"weights on GPU ({type(exc).__name__}: {exc})")
         self.packed = []
+        self._host_refs = []
         code2 = None
         for i, linears in enumerate(self._linears):
             on_host = host_all is not None and i not in resident
@@ -352,6 +353,13 @@ class FastQwen2:
             packed, c2 = repack_layer(linears, dev, host=on_host, out=out)
             code2 = c2 if code2 is None else code2
             self.packed.append(packed)
+            if on_host:
+                for mod in linears.values():
+                    wt = mod.weight
+                    qs = wt.quant_state
+                    s2 = qs.state2
+                    self._host_refs.append((wt, wt.data, qs, qs.code, qs.absmax, qs.offset,
+                                            s2.absmax, s2.code))
         self.pipe = (WeightPipe(self.packed, dev, side=self.dq_stream, resident=resident)
                      if host_all is not None else None)
         torch.cuda.empty_cache()     # whatever the load left in the cache goes back to the driver
@@ -454,6 +462,44 @@ class FastQwen2:
         parts.append("embedding in pinned host memory, streamed head" if self.emb_on_host
                      else f"embedding on GPU, {self.head_impl} head")
         return "; ".join(parts + self.notes)
+
+    @torch.no_grad()
+    def reclaim_gpu_copies(self):
+        """The streamed placement keeps no model weight on the GPU. If something copied the
+        module's weights there anyway (accelerate's prepare_model calls model.to(device) on a model
+        without hf_device_map), point the modules back at the host buffers they were views of and
+        free the GPU copies. Returns the MiB freed."""
+        self.ready()
+        freed = 0
+
+        def back(obj, attr, ref):
+            nonlocal freed
+            cur = getattr(obj, attr, None)
+            if cur is None or ref is None or cur.data_ptr() == ref.data_ptr():
+                return
+            if cur.is_cuda:
+                freed += cur.numel() * cur.element_size()
+            setattr(obj, attr, ref)
+
+        for wt, data, qs, code, absmax, offset, abs2, code2 in getattr(self, "_host_refs", []):
+            if wt.data.data_ptr() != data.data_ptr():
+                if wt.data.is_cuda:
+                    freed += wt.data.numel() * wt.data.element_size()
+                wt.data = data
+            back(qs, "code", code)
+            back(qs, "absmax", absmax)
+            back(qs, "offset", offset)
+            back(qs.state2, "absmax", abs2)
+            back(qs.state2, "code", code2)
+        if self.emb_on_host:
+            w = self._qwen.embed_tokens.weight
+            if w.data.data_ptr() != self.emb.data_ptr():
+                if w.data.is_cuda:
+                    freed += w.data.numel() * w.data.element_size()
+                w.data = self.emb
+        if freed:
+            torch.cuda.empty_cache()
+        return freed / 2**20
 
     @torch.no_grad()
     def restore_stock(self):
@@ -1245,9 +1291,8 @@ def warmup_specs(runner_cfg=None):
     head = "rows" if (config.HEAD_IMPL == "rows" and not config.OFFLOAD_EMBEDDING) else "chunks"
     specs = (k_nf4.warmup_specs() + k_norm.warmup_specs(hidden) + epi
              + k_mlp.warmup_specs(inter) + k_head.warmup_specs(hidden, config.HEAD_VOCAB_CHUNK, head))
-    if head == "chunks" and config.SELF_TEST and config.FALLBACK_RESIDENT:
-        # the v5 head of the fallback placement, compiled last (it is only launched if needed)
-        specs += k_head.warmup_specs(hidden, config.HEAD_VOCAB_CHUNK, "rows")
+    # (v8: the v5 head of the fallback placement is no longer precompiled; it compiles on demand
+    # in the rare run that falls back)
     if impl == "triton":
         specs += k_attn.warmup_specs(nq, nkv, hd)
     return specs

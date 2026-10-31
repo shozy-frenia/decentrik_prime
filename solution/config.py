@@ -72,6 +72,10 @@ HOST_CAPACITY = 2048
 # as soon as apply() runs.
 EARLY_PINNED = True
 
+# Unregister (unpin) our page-locked host buffers once the training loop is over, in a
+# background thread while Soup saves and wraps up (hostmem.release_async).
+EARLY_RELEASE = True
+
 # Before training (in the background build, while Soup builds the trainer): run the LM head
 # against an fp32 reference on a few random rows and one forward + backward of a small synthetic
 # batch through every kernel and copy path (fast_qwen.FastQwen2.self_test). If the streamed
