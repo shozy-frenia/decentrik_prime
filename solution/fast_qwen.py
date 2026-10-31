@@ -236,6 +236,7 @@ class FastQwen2:
                 p.data = p.data.to(dev)
         self._qwen, self._seed = qwen, seed
         self._overrides = {}           # placement switches forced by use_resident_layout()
+        self._rx_check = None          # self-test: max error of the rebuilt residual stream
         self.pipe = None
         self.emb_on_host = False
         self.test_note = "not run"
@@ -614,15 +615,28 @@ class FastQwen2:
         batch = self.pack(ids, mask, labels)
         if batch is None:
             raise RuntimeError("self-test batch could not be packed")
-        loss_sum, stats = run_step(self, batch)
-        loss_sum.backward()
-        torch.cuda.synchronize(self.device)
+        self._rx_check = {"max": 0.0}
+        try:
+            loss_sum, stats = run_step(self, batch)
+            loss_sum.backward()
+            torch.cuda.synchronize(self.device)
+        finally:
+            rx = self._rx_check
+            self._rx_check = None
+        rx_note = ""
+        if getattr(self.last_plan, "rx", False):
+            rx_note = f", residual rebuild max rel. err {rx['max']:.1e}"
+            if not rx["max"] < 1e-4:
+                # keep the fp32 checkpoints instead (and their arena) for the real steps
+                self._overrides["RECONSTRUCT_X"] = False
+                self.start_host_alloc(self.host_cap or int(config.HOST_CAPACITY), {"x"})
+                rx_note += " -> rebuild off, fp32 checkpoints kept"
         bad = [i for i, p in enumerate(self.lora_params)
                if p.grad is None or not bool(torch.isfinite(p.grad).all())]
         if not bool(torch.isfinite(loss_sum)) or not bool(torch.isfinite(stats).all()) or bad:
             raise RuntimeError(f"self-test step not finite (loss {float(loss_sum)}, "
                                f"{len(bad)} bad LoRA gradients)")
-        return f"ok ({batch.n} tokens, loss/token {float(loss_sum) / max(batch.n_lab, 1):.2f})"
+        return f"ok ({batch.n} tokens, loss/token {float(loss_sum) / max(batch.n_lab, 1):.2f}{rx_note})"
 
     # ------------------------------------------------------------------ helpers
     def _rope_table(self, n):
@@ -773,10 +787,11 @@ class FastQwen2:
         return batch
 
     # ------------------------------------------------------------------ activation storage
-    HOST_KINDS = ("x", "gu", "qkv", "out", "op")
+    HOST_KINDS = ("x", "d", "gu", "qkv", "out", "op")
 
     def arena_widths(self):
-        return {"x": (self.D, torch.float32), "gu": (2 * self.I, torch.float16),
+        return {"x": (self.D, torch.float32), "d": (self.D, torch.float16),
+                "gu": (2 * self.I, torch.float16),
                 "qkv": ((self.NQ + 2 * self.NKV) * self.HD, torch.float16),
                 "out": (self.NQ * self.HD, torch.float16), "op": (self.D, torch.float16)}
 
@@ -789,6 +804,8 @@ class FastQwen2:
             kinds = set(arena_kinds())
         if self.attn_impl != "varlen":
             kinds -= {"qkv", "out", "op"}
+            if "d" in kinds:                     # reconstruction needs the saved O outputs
+                kinds = (kinds - {"d"}) | {"x"}
         width = self.arena_widths()
         kinds = sorted(k for k in kinds if k not in self.host)
         if not kinds or cap <= 0:
@@ -825,6 +842,7 @@ class FastQwen2:
         plan.gu = fits and config.SAVE_GU and "gu" in self.host
         plan.attn = (fits and config.SAVE_ATTN and self.attn_impl == "varlen"
                      and all(k in self.host for k in ("qkv", "out", "op")))
+        plan.rx = bool(plan.attn and self._opt("RECONSTRUCT_X") and "d" in self.host)
         plan.arenas = self.host
         plan.last = self.L - 1
         return plan
@@ -914,7 +932,10 @@ class FastQwen2:
                             seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
                 x = x_new
             store.retire(i - store.IN_FLIGHT)
-            store.put(i, "x", x, plan.x)
+            if not plan.rx:
+                store.put(i, "x", x, plan.x)
+            elif self._rx_check is not None:
+                store.put(i, "xchk", x, False)      # self-test: the real x, to check the rebuild
             nxt = i + 1 if i + 1 < self.L else None
             self._ws_use("attn", i)
             qkv, _aq, _av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=plan.attn)
@@ -935,6 +956,8 @@ class FastQwen2:
             rms_forward(x, self.w_post[i], y2, rstd2_all[i], self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
             del op
+            if plan.rx:
+                x = None                         # not kept: the backward rebuilds it
             self._ws_use("mlp", i)
             self._weights_ahead(i + 2)
             if config.EARLY_RETIRE:
@@ -943,13 +966,30 @@ class FastQwen2:
                 # i.e. a down GEMM and an attention block ago. One layer of saved activations
                 # less at the forward's peak (~44 MB for 838 tokens).
                 store.retire(i - 1)
-            gu = torch.mm(y2, self.W_gu.t())
-            act = torch.empty((n, self.I), dtype=f16, device=dev)
-            gated_silu_forward(gu, act)
-            if plan.gu:
-                store.put(i, "gu", gu, True)        # the backward reads it instead of a gate|up GEMM
+            parts = int(config.GU_SPLIT) if (plan.gu and i < self.L - 1) else 1
+            if parts > 1 and n >= 32 * parts:
+                # gate|up in row blocks: each block's copy to the host arena starts as soon as its
+                # GEMM is done, so layer i's copy is complete when layer i+1 retires it (above)
+                gu = torch.empty((n, 2 * self.I), dtype=f16, device=dev)
+                edges = [0] + [min(n, -(-(n * k // parts) // 16) * 16) for k in range(1, parts)] + [n]
+                for r0, r1 in zip(edges[:-1], edges[1:]):
+                    if r1 > r0:
+                        torch.mm(y2[r0:r1], self.W_gu.t(), out=gu[r0:r1])
+                        store.put_rows(i, "gu", gu, r0, r1)
+                act = torch.empty((n, self.I), dtype=f16, device=dev)
+                gated_silu_forward(gu, act)
+            else:
+                gu = torch.mm(y2, self.W_gu.t())
+                act = torch.empty((n, self.I), dtype=f16, device=dev)
+                gated_silu_forward(gu, act)
+                if plan.gu:
+                    store.put(i, "gu", gu, True)    # the backward reads it instead of a gate|up GEMM
             del gu
             d16 = torch.mm(act, self.W_d.t())
+            if plan.rx:
+                # the MLP output (fp16) instead of the fp32 layer input: the backward rebuilds the
+                # residual stream from the top, x_i = (x_{i+1} - d_i) - o_i
+                store.put(i, "d", d16, True)
             self._ws_release("mlp", nxt)
             del act
             x = h1
@@ -1045,7 +1085,8 @@ class FastQwen2:
         gscale = (g_loss.detach().reshape(1).to(f32) / float(config.HEAD_GRAD_SCALE)).contiguous()
         dh = torch.empty((n, D), dtype=f32, device=dev)
         dh16 = torch.empty((n, D), dtype=f16, device=dev)     # fp16 copy of dh for the GEMMs
-        rms_backward(saved.pop("dy_head"), gscale, saved.pop("hf"), self.w_final, saved.pop("rstd_f"),
+        x_next = saved.pop("hf")
+        rms_backward(saved.pop("dy_head"), gscale, x_next, self.w_final, saved.pop("rstd_f"),
                      dh, out16=dh16, dummy16=self.dummy16, dummy32=self.dummy32)
         # y / y2 (the GEMM inputs of norm 1 / norm 2) only for what is recomputed
         y = None if plan.attn else torch.empty((n, D), dtype=f16, device=dev)
@@ -1058,10 +1099,30 @@ class FastQwen2:
         grads = [None] * len(self.lora_params)
         s = self.lora_scale
         for i in reversed(range(self.L)):
-            x = store.get(i, "x")
-            if i > 0:
-                store.prefetch(i - 1, "x")
-                store.prefetch(i - 1, "op")
+            op_top = None
+            if plan.rx:
+                # the residual stream backwards from the final hidden state: the forward computed
+                # h_i = x_i + o_i and x_{i+1} = h_i + d_i in fp32; undoing both additions gives
+                # back x_i to within an fp32 rounding (~1e-7 relative)
+                d_i = store.get(i, "d")
+                op_top = store.get(i, "op")
+                x = torch.sub(x_next, d_i).sub_(op_top)
+                x_next = x
+                del d_i
+                if self._rx_check is not None:
+                    xs = store.get(i, "xchk")
+                    err = float((x - xs).abs().max() / xs.abs().max().clamp_min(1e-30))
+                    self._rx_check["max"] = max(self._rx_check["max"], err)
+                    del xs
+                if i > 0:
+                    store.prefetch(i - 1, "d")
+                    store.prefetch(i - 1, "op")
+            else:
+                x = store.get(i, "x")
+                x_next = None
+                if i > 0:
+                    store.prefetch(i - 1, "x")
+                    store.prefetch(i - 1, "op")
             aq16, bq16, av16, bv16 = self.lora16[4 * i:4 * i + 4]
             prv = i - 1 if i > 0 else None
             # norm 1 again: the dropout-masked LoRA inputs (same Philox seeds) and rstd; y itself
@@ -1072,7 +1133,8 @@ class FastQwen2:
             if plan.attn:
                 aq = store.get(i, "aq")
                 av = store.get(i, "av")
-                op = store.get(i, "op")
+                op = op_top if op_top is not None else store.get(i, "op")
+                op_top = None
             else:
                 self._ws_use("attn", i)
                 qkv, aq, av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=True)
@@ -1153,7 +1215,7 @@ class _Batch:
 
 class _Plan:
     """Per-step choice of what the forward keeps for the backward (see FastQwen2._save_plan)."""
-    x = gu = attn = False
+    x = gu = attn = rx = False
     arenas = None
     last = 0
 
@@ -1197,6 +1259,24 @@ class _ActStore:
         with torch.cuda.stream(self.side):
             self.side.wait_event(ready)
             arena[i, :self.n].copy_(t, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(self.side)
+        self.inflight.setdefault(i, []).append((t, done))
+        self.where[(i, kind)] = (arena, t.dtype, tuple(t.shape))
+
+    def put_rows(self, i, kind, t, r0, r1):
+        """Copy rows [r0, r1) of t (written by the main stream up to now) into row i of the
+        arena; the other rows follow in later calls, before the tensor is retired or read."""
+        arena = self.m.host.get(kind) if i < self.m.L - 1 else None
+        if arena is None:
+            self.gpu[(i, kind)] = t
+            return
+        main = torch.cuda.current_stream(self.m.device)
+        ready = torch.cuda.Event()
+        ready.record(main)
+        with torch.cuda.stream(self.side):
+            self.side.wait_event(ready)
+            arena[i, r0:r1].copy_(t[r0:r1], non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.side)
         self.inflight.setdefault(i, []).append((t, done))
@@ -1308,7 +1388,8 @@ def arena_kinds():
     """Activation kinds kept in host arenas with the current switches (varlen attention assumed)."""
     kinds = []
     if config.OFFLOAD_CHECKPOINTS:
-        kinds.append("x")
+        reconstruct = config.RECONSTRUCT_X and config.SAVE_ATTN and config.ATTN_IMPL == "varlen"
+        kinds.append("d" if reconstruct else "x")
     if config.SAVE_GU:
         kinds.append("gu")
     if config.SAVE_ATTN:
@@ -1327,7 +1408,7 @@ def pinned_specs(shapes=QWEN15):
         specs.append(("weights", (L * layer_bytes,), torch.uint8))
     if config.OFFLOAD_EMBEDDING:
         specs.append(("embedding", (V, D), torch.float16))
-    width = {"x": (D, torch.float32), "gu": (2 * I, torch.float16),
+    width = {"x": (D, torch.float32), "d": (D, torch.float16), "gu": (2 * I, torch.float16),
              "qkv": ((NQ + 2 * NKV) * HD, torch.float16), "out": (NQ * HD, torch.float16),
              "op": (D, torch.float16)}
     cap = int(config.HOST_CAPACITY)

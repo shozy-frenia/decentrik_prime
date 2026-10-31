@@ -49,8 +49,8 @@ LOAD_CONVERT_ON_GPU = True
 # "chunks" = v6 streamed one-pass head over vocabulary chunks (works with a resident embedding
 #            too); "rows" = v5 head (token chunks against the whole vocabulary, embedding on GPU).
 HEAD_IMPL = "chunks"
-HEAD_VOCAB_CHUNK = 2048     # embedding rows per chunk (6.3 MB fp16); every width is a multiple of 16
-HEAD_RING = 2               # GPU buffers the streamed embedding cycles through (v10: 2 x 6.3 MB, was 3 x 12.6 MB)
+HEAD_VOCAB_CHUNK = 1024     # embedding rows per chunk (3.1 MB fp16); every width is a multiple of 16
+HEAD_RING = 2               # GPU buffers the streamed embedding cycles through (2 x 3.1 MB)
 # v5 head: tokens per chunk (logits are materialised for this many rows: CHUNK x 151936 x 2 bytes).
 HEAD_CHUNK = 256
 
@@ -67,9 +67,20 @@ HEAD_GRAD_SCALE = 1024.0
 # A batch with more tokens than HOST_CAPACITY (4 rows x 512 tokens is the task's maximum) is
 # recomputed instead, with the same result.
 SAVE_GU = True
+# Release the allocator's cached blocks before a batch larger than any before it, so the step that
+# sets the memory peak starts from the live tensors only (not from blocks shaped by earlier steps).
+EMPTY_CACHE_ON_GROWTH = True
 # Release layer i-1's saved activations (once copied out) before layer i's gate|up GEMM instead of
 # at the start of layer i+1: one layer less of them on the GPU at the forward's memory peak.
 EARLY_RETIRE = True
+# Compute gate|up in this many row blocks; each block is copied to the host as soon as its GEMM is
+# done (instead of after the whole GEMM and the SiLU), so EARLY_RETIRE rarely waits for the copy.
+GU_SPLIT = 2
+# Instead of the fp32 layer input (6 KB/token/layer), keep the MLP output (fp16, 3 KB/token/layer)
+# and rebuild the residual stream backwards in the backward: x_i = (x_{i+1} - d_i) - o_i, from the
+# final hidden state down (exact up to one fp32 rounding per addition undone). Halves the
+# checkpoint traffic over PCIe in both directions and the pinned arena for it.
+RECONSTRUCT_X = True
 SAVE_ATTN = True
 HOST_CAPACITY = 2048
 

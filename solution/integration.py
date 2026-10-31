@@ -542,6 +542,9 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
     if batch is None:
         return _stock_compute_loss(self, model, inputs, return_outputs, num_items_in_batch)
     inputs.pop("_prediction_loss_only", None)
+    if config.EMPTY_CACHE_ON_GROWTH and batch.n > getattr(runner, "_max_n", 0):
+        runner._max_n = batch.n
+        torch.cuda.empty_cache()        # the GPU is idle here (the harness synchronises each step)
     t0 = time.perf_counter()
     loss_sum, stats = run_step(runner, batch)
 
@@ -599,7 +602,9 @@ def _plan_text(runner):
     if plan is None:
         return "?"
     kept = [name for name, on in (("gate|up", plan.gu), ("attention", plan.attn),
-                                  ("checkpoints on host", plan.x)) if on]
+                                  ("checkpoints on host", plan.x),
+                                  ("MLP outputs (residual stream rebuilt backwards)",
+                                   getattr(plan, "rx", False))) if on]
     return ", ".join(kept) or "nothing (recompute)"
 
 
