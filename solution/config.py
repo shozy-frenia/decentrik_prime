@@ -107,8 +107,10 @@ EARLY_RELEASE = True
 # itself for any kernel that needs more (cudactx.py).
 CUDA_STACK_BYTES = 16
 # cuBLAS workspace of 8 x 16 KiB per handle and stream (CUBLAS_WORKSPACE_CONFIG=:16:8) instead of
-# ~8 MiB (cleared with the organisers, Q51). cuBLAS may then pick other GEMM algorithms.
-CUBLAS_SMALL_WORKSPACE = True
+# ~8 MiB (cleared with the organisers, Q51). Off in v17: measured in v15/v16, the 128 KiB workspace
+# leaves cuBLAS without its split-K algorithms and the LM head's GEMMs ran 13-26 ms per step slower
+# (head 44 -> 57-70 ms), worth more than the MiB it saves.
+CUBLAS_SMALL_WORKSPACE = False
 # AdamW's moment buffers (17 MB) in pinned host memory between optimizer steps, copied in before
 # and out after each step by optimizer step hooks (optstate.py; cleared with the organisers, Q50).
 OFFLOAD_OPTIMIZER = True
