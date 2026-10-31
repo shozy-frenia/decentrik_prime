@@ -103,10 +103,10 @@ def main():
     install_fake_torch()
     from solution import fast_qwen
 
-    L, SPLIT, SPLIT_D, NQB = 6, 1024, 3072, 4096
+    L, SPLIT, SPLIT_U, SPLIT_D, NQB = 6, 1024, 2048, 3072, 4096
     m = object.__new__(fast_qwen.FastQwen2)
     m.pipe, m.overlap, m.split_q, m.n_dequant = None, True, SPLIT, 0
-    m.split_d = SPLIT_D
+    m.split_d, m.split_u = SPLIT_D, SPLIT_U
     m.ws_have = {"attn": None, "mlp": None}
     m.ev_free = {"attn": Event(), "mlp": Event()}
     m.ev_ready = {"attn": Event(), "mlp": Event()}
@@ -116,14 +116,15 @@ def main():
     m.code2 = m.nf4 = m.ws = None
     writes = []         # (op, region, (part, layer))
     reads = []          # (op, region, (part, layer) expected)
-    parts = {(0, SPLIT): "attn", (SPLIT, NQB): "mlp", (SPLIT, SPLIT_D): "gu", (SPLIT_D, NQB): "dn"}
+    parts = {(0, SPLIT): "attn", (SPLIT, NQB): "mlp", (SPLIT, SPLIT_D): "gu", (SPLIT_D, NQB): "dn",
+             (SPLIT, SPLIT_U): "g", (SPLIT_U, SPLIT_D): "u"}
 
     def region(part):
         return "attn" if part == "attn" else "mlp"
 
     def fake_dequant_range(layer, q0, q1, code2, nf4, out, dst=None):
         part = parts[(q0, q1)]
-        assert (dst is not None) == (part == "dn"), (part, dst)
+        assert (dst is not None) == (part in ("dn", "u")), (part, dst)
         writes.append((CUR[0].add(("dequant", part, layer.layer)), region(part), (part, layer.layer)))
 
     fast_qwen.dequant_range = fake_dequant_range
@@ -131,8 +132,9 @@ def main():
     def gemm(part, i):
         reads.append((CUR[0].add(("gemm", part, i)), region(part), (part, i)))
 
-    for overlap, shared in ((True, False), (False, False), (True, True), (False, True)):
-        m.overlap, m.share_mlp = overlap, shared
+    for overlap, shared in ((True, False), (False, False), (True, True), (False, True),
+                            (True, "split"), (False, "split")):
+        m.overlap, m.share_mlp = overlap, bool(shared)
         per_step = []
         for step in range(3):
             d0 = m.n_dequant
@@ -145,7 +147,19 @@ def main():
                 gemm("attn", i)
                 m._ws_release("attn", nxt)
                 MAIN.add(("norm",))
-                if shared:
+                if shared == "split":
+                    m._ws_use("g", i)
+                    gemm("g", i)
+                    m._ws_release("g", i, "u")
+                    m._ws_use("u", i)
+                    gemm("u", i)                                # two row blocks of up
+                    gemm("u", i)
+                    m._ws_release("u", i, "dn")
+                    MAIN.add(("silu",))
+                    m._ws_use("dn", i)
+                    gemm("dn", i)
+                    m._ws_release("dn", nxt, "g")
+                elif shared:
                     m._ws_use("gu", i)
                     gemm("gu", i)                               # two row blocks of gate|up
                     gemm("gu", i)
@@ -164,7 +178,18 @@ def main():
                 prv = i - 1 if i > 0 else None
                 m._ws_use("attn", i)
                 gemm("attn", i)                                 # recompute qkv, o
-                if shared:
+                if shared == "split":
+                    m._ws_use("dn", i)
+                    gemm("dn", i)
+                    m._ws_release("dn", i, "g")
+                    MAIN.add(("silu_bwd",))
+                    m._ws_use("g", i)
+                    gemm("g", i)
+                    m._ws_release("g", i, "u")
+                    m._ws_use("u", i)
+                    gemm("u", i)
+                    m._ws_release("u", prv, "dn")
+                elif shared:
                     m._ws_use("dn", i)
                     gemm("dn", i)                               # d^T
                     m._ws_release("dn", i, "gu")
@@ -193,7 +218,10 @@ def main():
         print(f"overlap={overlap} shared_mlp={shared}: dequants per step {per_step} (layers {L}), "
               f"{len(reads)} weight reads, hazards: {bad}")
         assert bad == 0
-        if shared:   # forward: attn, gu, dn per layer; backward: dn, gu, attn; two reuses per turn
+        if shared == "split":   # forward: attn, g, u, dn; backward: dn, g, u, attn
+            print(f"     split gate/up dequants per step {per_step}")
+            assert all(x == 8 * L - 3 for x in per_step[1:]), per_step
+        elif shared:   # forward: attn, gu, dn per layer; backward: dn, gu, attn; two reuses per turn
             assert per_step[0] == 6 * L - 2 and all(x == 6 * L - 4 for x in per_step[1:]), per_step
         else:
             assert per_step[0] == 4 * L - 2 and all(x == 4 * L - 4 for x in per_step[1:]), per_step
