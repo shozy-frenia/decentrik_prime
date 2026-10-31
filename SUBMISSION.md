@@ -67,5 +67,5 @@ memory, quality), limits and next steps.
   memory-efficient attention; our kernels do the memory-bound work.
 - LoRA dropout masks come from our Philox stream, not PyTorch's: same distribution, not the same
   draw, so the loss curve matches the base within tolerance but not bit for bit after step 1.
-- v8 (hf_device_map fix, exact-size registered host buffers, early unpinning) is unmeasured; v6 measured 51.2 s / 1751 MiB (1070 MiB of it were duplicate weights copied by accelerate, fixed in v8).
+- Measured on Kaggle T4 (v8, `run_task.py --only solution`): 47.2 s, 661 MiB, eval loss 2.04953. v9/v10 (TRL reuses the package map, bf16->fp16 load conversion on the GPU, smaller embedding ring: 2 x 2048 rows, setup profiler off) are unmeasured.
   the tables above from the notebook run, not from the README's estimates.
