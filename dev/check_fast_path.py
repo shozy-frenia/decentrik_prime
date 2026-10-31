@@ -470,6 +470,100 @@ def main():
         extra["pcie"] = out
         print("pcie", out, flush=True)
 
+    def gemm_bench():
+        """The step's GEMM shapes on this T4: TFLOPS of each layer GEMM (forward TN, backward NN) at
+        three token counts, with cuBLAS (PyTorch's default choice) and cuBLASLt, and split-K for
+        the two small-output GEMMs (down forward, gate|up backward); measured after 2 s of
+        back-to-back GEMMs (sustained clocks), plus the clock/power drift during that warm-up."""
+        import subprocess
+
+        def smi():
+            r = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,power.draw,temperature.gpu",
+                                "--format=csv,noheader,nounits"], capture_output=True, text=True)
+            return r.stdout.strip().splitlines()[0] if r.stdout.strip() else "?"
+
+        out = {}
+        D, I = 1536, 8960
+        a = torch.randn(1024, D, device="cuda").half()
+        w = torch.randn(2 * I, D, device="cuda").half()
+        drift = []
+        t_end = time.perf_counter() + 3.0
+        while time.perf_counter() < t_end:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(40):
+                torch.mm(a, w.t())
+            torch.cuda.synchronize()
+            dt = time.perf_counter() - t0
+            drift.append((round(40 * 2 * 1024 * D * 2 * I / dt / 1e12, 1), smi()))
+        out["sustained_gate_up_1024_TFLOPS_and_clock_power_temp"] = drift[::2]
+        W = {"qkv": torch.randn(2048, D, device="cuda").half(), "o": torch.randn(D, D, device="cuda").half(),
+             "gu": w, "down": torch.randn(D, I, device="cuda").half()}
+
+        def shapes(n):
+            x = torch.randn(n, D, device="cuda").half()
+            act = torch.randn(n, I, device="cuda").half()
+            gu = torch.randn(n, 2 * I, device="cuda").half()
+            q = torch.randn(n, 2048, device="cuda").half()
+            return {  # name: (fn, flops)
+                "fwd qkv": (lambda: torch.mm(x, W["qkv"].t()), 2 * n * D * 2048),
+                "fwd o": (lambda: torch.mm(x, W["o"].t()), 2 * n * D * D),
+                "fwd gate|up": (lambda: torch.mm(x, W["gu"].t()), 2 * n * D * 2 * I),
+                "fwd down": (lambda: torch.mm(act, W["down"].t()), 2 * n * I * D),
+                "bwd d act": (lambda: torch.mm(x, W["down"]), 2 * n * D * I),
+                "bwd d gate|up": (lambda: torch.mm(gu, W["gu"]), 2 * n * 2 * I * D),
+                "bwd d o": (lambda: torch.mm(x, W["o"]), 2 * n * D * D),
+                "bwd d qkv": (lambda: torch.mm(q, W["qkv"]), 2 * n * 2048 * D),
+            }, (act, gu)
+
+        def bench(fn, reps=10):
+            fn()
+            torch.cuda.synchronize()
+            ts = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                for _ in range(reps):
+                    fn()
+                torch.cuda.synchronize()
+                ts.append((time.perf_counter() - t0) / reps)
+            return sorted(ts)[1]
+
+        def splitk_down(act, s):
+            n, k = act.shape
+            kc = k // s
+            A = act.view(n, s, kc).transpose(0, 1)                    # [s, n, kc]
+            B = W["down"].view(D, s, kc).permute(1, 2, 0)            # [s, kc, D]
+            return lambda: torch.bmm(A, B, out_dtype=torch.float32).sum(0).half()
+
+        def splitk_dgu(gu, s):
+            n, k = gu.shape
+            kc = k // s
+            A = gu.view(n, s, kc).transpose(0, 1)
+            B = W["gu"].view(s, kc, D)
+            return lambda: torch.bmm(A, B, out_dtype=torch.float32).sum(0).half()
+
+        for n in (700, 1000, 1300):
+            fns, (act, gu) = shapes(n)
+            row = {}
+            for lib in ("default", "cublaslt"):
+                torch.backends.cuda.preferred_blas_library(lib)
+                tot = 0.0
+                for name, (fn, flops) in fns.items():
+                    t = bench(fn)
+                    tot += t
+                    row[f"{lib}: {name}"] = f"{t * 1e3:.3f} ms {flops / t / 1e12:.1f} TF"
+                row[f"{lib}: layer total fwd+bwd ms"] = round(tot * 1e3, 3)
+            torch.backends.cuda.preferred_blas_library("default")
+            for s in (2, 4):
+                try:
+                    row[f"split-K {s}: fwd down"] = f"{bench(splitk_down(act, s)) * 1e3:.3f} ms"
+                    row[f"split-K {s}: bwd d gate|up"] = f"{bench(splitk_dgu(gu, s)) * 1e3:.3f} ms"
+                except Exception as exc:  # noqa: BLE001
+                    row[f"split-K {s}"] = f"{type(exc).__name__}: {exc}"[:120]
+            out[f"N={n}"] = row
+            print("gemm", n, row, flush=True)
+        extra["gemm_bench"] = out
+
     def variants():
         """The v6 placement against variants, each its own runner on the same model, built and
         measured one after the other (the activation arenas are shared), the default once more at
@@ -478,9 +572,10 @@ def main():
         import gc
 
         keys = ("OFFLOAD_WEIGHTS", "OFFLOAD_EMBEDDING", "OFFLOAD_CHECKPOINTS", "RESIDENT_LAYERS",
-                "HEAD_IMPL", "SAVE_GU", "SAVE_ATTN", "DEQUANT_OVERLAP", "HOST_CAPACITY")
+                "HEAD_IMPL", "SAVE_GU", "SAVE_ATTN", "DEQUANT_OVERLAP", "HOST_CAPACITY", "BLAS_LT")
         base_cfg = {k: getattr(config, k) for k in keys}
         plan = [("v6 default (all in host memory)", {}),
+                ("cuBLASLt layer GEMMs", {"BLAS_LT": True}),
                 ("embedding on GPU", {"OFFLOAD_EMBEDDING": False}),
                 ("6 layers resident", {"RESIDENT_LAYERS": 6}),
                 ("checkpoints on GPU", {"OFFLOAD_CHECKPOINTS": False}),
@@ -594,6 +689,7 @@ def main():
 
     section("scaled", scaled)
     section("pcie", pcie)
+    section("gemm_bench", gemm_bench)
     # one set of activation arenas for every runner below; the first runner goes away so that its
     # GPU buffers do not count in the variants' peaks
     runner.start_host_alloc(int(config.HOST_CAPACITY), kinds={"x", "gu", "qkv", "out", "op"})
