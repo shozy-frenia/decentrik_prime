@@ -605,6 +605,9 @@ def _plan_text(runner):
                                   ("checkpoints on host", plan.x),
                                   ("MLP outputs (residual stream rebuilt backwards)",
                                    getattr(plan, "rx", False))) if on]
+    tail = getattr(plan, "gu_tail", 0)
+    if tail:
+        kept.append(f"gate|up rows recomputed in the backward: last {tail} of {getattr(plan, 'n', '?')}")
     return ", ".join(kept) or "nothing (recompute)"
 
 

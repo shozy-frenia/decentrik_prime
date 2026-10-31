@@ -78,9 +78,32 @@ EARLY_RETIRE = True
 GU_SPLIT = 2
 # Instead of the fp32 layer input (6 KB/token/layer), keep the MLP output (fp16, 3 KB/token/layer)
 # and rebuild the residual stream backwards in the backward: x_i = (x_{i+1} - d_i) - o_i, from the
-# final hidden state down (exact up to one fp32 rounding per addition undone). Halves the
-# checkpoint traffic over PCIe in both directions and the pinned arena for it.
-RECONSTRUCT_X = True
+# final hidden state down. v13: off. The v12 start-up self-test measured a max relative error of
+# 6.9e-3 (Qwen2.5's massive residual activations: undoing an addition in a channel where a later
+# layer is ~1e3 leaves an absolute error that is large next to the early layers' values), so it
+# switched the rebuild off in every run anyway, after the unused fp16 arena had been pinned.
+RECONSTRUCT_X = False
+# v13: the backward is PCIe-bound, not compute-bound (v12 timeline: a layer's host->GPU traffic,
+# 24.3 MB of 4-bit weights + 51 KB/token of saved activations, takes ~5.3 ms at ~12 GB/s for 767
+# tokens; the layer that needs no copy computes in 4.3 ms). The gate|up output is 35 of those
+# 51 KB/token, and its copy can only start once the previous layer's gate|up block is free. So
+# the last GU_RECOMPUTE_ROWS + GU_RECOMPUTE * N token rows of each layer's gate|up output
+# (rounded down to 16, at most N/3) are NOT copied to the host: the backward recomputes them
+# (norm 2 for those rows from x + o_proj, then the gate|up GEMM with the same row count as the
+# forward's last block, i.e. the same cuBLAS kernel) while the copy of the other rows is in
+# flight. Sized from the v12 timeline so that link time and compute time per backward layer meet:
+# link ~2.0 ms + 4.3 us/token, compute ~1.5 ms + 4.1 us/token; each recomputed row moves ~3 us
+# from the link to the compute (e.g. 112 of 853 rows). 0 and 0 = keep every row (v12). The
+# start-up self-test compares the recomputed rows with the forward's and switches this off on a
+# mismatch.
+GU_RECOMPUTE = 0.07
+GU_RECOMPUTE_ROWS = 64
+# v13: in the backward, queue the next-but-one layer's 4-bit weight copy at the start of a layer
+# (while the MLP backward runs and the link only carries the x / o_proj prefetch) instead of after
+# the MLP backward, where it competed for the link with the gate|up copy the next layer waits for.
+# The slot's previous layer had both halves queued for dequantisation one layer earlier; the
+# copy is ordered after them by events as before (dev/test_ws_schedule.py).
+BWD_WEIGHTS_EARLY = True
 SAVE_ATTN = True
 HOST_CAPACITY = 2048
 

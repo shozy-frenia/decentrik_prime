@@ -237,6 +237,7 @@ class FastQwen2:
         self._qwen, self._seed = qwen, seed
         self._overrides = {}           # placement switches forced by use_resident_layout()
         self._rx_check = None          # self-test: max error of the rebuilt residual stream
+        self._gu_check = None          # self-test: recomputed gate|up rows vs the forward's
         self.pipe = None
         self.emb_on_host = False
         self.test_note = "not run"
@@ -616,6 +617,7 @@ class FastQwen2:
         if batch is None:
             raise RuntimeError("self-test batch could not be packed")
         self._rx_check = {"max": 0.0}
+        self._gu_check = {"max": 0.0, "rows": 0, "checked": 0}
         try:
             loss_sum, stats = run_step(self, batch)
             loss_sum.backward()
@@ -623,9 +625,23 @@ class FastQwen2:
         finally:
             rx = self._rx_check
             self._rx_check = None
+            guc = self._gu_check
+            self._gu_check = None
         rx_note = ""
+        if guc["rows"]:
+            # the recomputed gate|up rows must be the forward's (the same kernels on the same
+            # inputs; a different cuBLAS algorithm would differ in the last fp16 bits at most)
+            rx_note += (f", gate|up rows recomputed in the backward {guc['rows']} (max rel. diff "
+                        f"{guc['max']:.1e} over {guc['checked']} layers)")
+            if not (guc["max"] < 1e-2 and guc["checked"] > 0):
+                self._overrides["GU_RECOMPUTE"] = 0.0
+                rx_note += " -> recompute off, every row kept"
+        elif self._gu_tail(batch.n) and getattr(self.last_plan, "gu", False):
+            # the path was planned but never ran: do not use it untested
+            self._overrides["GU_RECOMPUTE"] = 0.0
+            rx_note += ", gate|up recompute not exercised -> off"
         if getattr(self.last_plan, "rx", False):
-            rx_note = f", residual rebuild max rel. err {rx['max']:.1e}"
+            rx_note += f", residual rebuild max rel. err {rx['max']:.1e}"
             if not rx["max"] < 1e-4:
                 # keep the fp32 checkpoints instead (and their arena) for the real steps
                 self._overrides["RECONSTRUCT_X"] = False
@@ -843,9 +859,38 @@ class FastQwen2:
         plan.attn = (fits and config.SAVE_ATTN and self.attn_impl == "varlen"
                      and all(k in self.host for k in ("qkv", "out", "op")))
         plan.rx = bool(plan.attn and self._opt("RECONSTRUCT_X") and "d" in self.host)
+        plan.gu_tail = self._gu_tail(n) if plan.gu else 0
+        plan.n = n
         plan.arenas = self.host
         plan.last = self.L - 1
         return plan
+
+    def _gu_tail(self, n):
+        """v13 (config.GU_RECOMPUTE, GU_RECOMPUTE_ROWS): how many trailing token rows of each
+        layer's gate|up output are recomputed in the backward instead of going through host memory
+        (a multiple of 16, at most n / 3; 0 for tiny batches or when switched off)."""
+        try:
+            f = float(self._opt("GU_RECOMPUTE") or 0.0)
+            base = int(self._opt("GU_RECOMPUTE_ROWS") or 0) if f > 0.0 else 0
+        except (TypeError, ValueError):
+            return 0
+        if (f <= 0.0 and base <= 0) or n < 64:
+            return 0
+        k = min(int(base + n * min(f, 0.5)), n // 3) // 16 * 16
+        return k if 0 < k < n else 0
+
+    def _gu_rows(self, gu, x, op, i, tail):
+        """Rows [n - tail, n) of layer i's gate|up output, as the forward computed them: norm 2 of
+        x + o_proj for those rows (the same kernel; RMSNorm is per row and norm 2 has no dropout),
+        then the gate|up GEMM on exactly the forward's last row block."""
+        n, D = x.shape
+        m = n - tail
+        y2r = torch.empty((tail, D), dtype=torch.float16, device=self.device)
+        rs = torch.empty(tail, dtype=torch.float32, device=self.device)
+        rms_forward(x[m:], self.w_post[i], y2r, rs, self.eps, delta=op[m:],
+                    dummy16=self.dummy16, dummy32=self.dummy32)
+        torch.mm(y2r, self.W_gu.t(), out=gu[m:])
+        del y2r, rs
 
     # ------------------------------------------------------------------ one layer, forward part
     def _attn_part(self, i, x_norm, xq, xv, batch, grad=False):
@@ -966,16 +1011,29 @@ class FastQwen2:
                 # i.e. a down GEMM and an attention block ago. One layer of saved activations
                 # less at the forward's peak (~44 MB for 838 tokens).
                 store.retire(i - 1)
-            parts = int(config.GU_SPLIT) if (plan.gu and i < self.L - 1) else 1
-            if parts > 1 and n >= 32 * parts:
+            hosted = plan.gu and i < self.L - 1
+            parts = int(config.GU_SPLIT) if hosted else 1
+            tail = plan.gu_tail if hosted else 0
+            if (parts > 1 and n >= 32 * parts) or tail:
                 # gate|up in row blocks: each block's copy to the host arena starts as soon as its
-                # GEMM is done, so layer i's copy is complete when layer i+1 retires it (above)
+                # GEMM is done, so layer i's copy is complete when layer i+1 retires it (above).
+                # v13: the last `tail` rows are computed as one more block but not copied out; the
+                # backward recomputes exactly that block (same rows, same GEMM shape).
                 gu = torch.empty((n, 2 * self.I), dtype=f16, device=dev)
-                edges = [0] + [min(n, -(-(n * k // parts) // 16) * 16) for k in range(1, parts)] + [n]
+                m = n - tail
+                if parts > 1 and m >= 32 * parts:
+                    edges = [0] + [min(m, -(-(m * k // parts) // 16) * 16) for k in range(1, parts)] + [m]
+                else:
+                    edges = [0, m]
                 for r0, r1 in zip(edges[:-1], edges[1:]):
                     if r1 > r0:
                         torch.mm(y2[r0:r1], self.W_gu.t(), out=gu[r0:r1])
                         store.put_rows(i, "gu", gu, r0, r1)
+                if tail:
+                    torch.mm(y2[m:], self.W_gu.t(), out=gu[m:])
+                    store.keep_rows(i, "gu", m)
+                    if getattr(self, "_gu_check", None) is not None and i % 3 == 0:
+                        store.put(i, "guchk", gu[m:].clone(), False)   # self-test reference
                 act = torch.empty((n, self.I), dtype=f16, device=dev)
                 gated_silu_forward(gu, act)
             else:
@@ -1098,7 +1156,13 @@ class FastQwen2:
         rstd2_all = saved.pop("rstd2")
         grads = [None] * len(self.lora_params)
         s = self.lora_scale
+        early_w = bool(config.BWD_WEIGHTS_EARLY)
         for i in reversed(range(self.L)):
+            if early_w:
+                # layer i's two halves were queued for dequantisation in iteration i + 1 (or in the
+                # forward, for the last layer), so slot i % 2 may receive layer i - 2 now: its copy
+                # runs under this layer's MLP backward instead of next to the gate|up prefetch
+                self._weights_ahead(i - 2)
             op_top = None
             if plan.rx:
                 # the residual stream backwards from the final hidden state: the forward computed
@@ -1151,9 +1215,30 @@ class FastQwen2:
                 rstd2_i, delta2 = rstd2, None
                 del op
             self._ws_use("mlp", i)
-            gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())
-            # MLP backward
+            # MLP backward. v13: d(act) needs only dh and W_down, so it is issued before the main
+            # stream waits for the gate|up copy (v12 waited first): the GEMM runs under the copy.
+            # Same live tensors as before (the gate|up buffer was allocated by its prefetch).
             dact = torch.mm(dh16, self.W_d)
+            if plan.gu:
+                tail = store.tail_rows(i, "gu")
+                if tail:
+                    # v13: the rows the forward did not copy out, recomputed into the prefetched
+                    # tensor while the copy of the other rows is still in flight
+                    gbuf = store.peek(i, "gu")
+                    self._gu_rows(gbuf, x, delta2, i, tail)
+                    if getattr(self, "_gu_check", None) is not None:
+                        self._gu_check["rows"] += tail
+                        if (i, "guchk") in store.gpu:
+                            ref = store.get(i, "guchk").float()
+                            got = gbuf[n - tail:].float()
+                            err = float((got - ref).abs().max() / ref.abs().max().clamp_min(1e-30))
+                            self._gu_check["max"] = max(self._gu_check["max"], err)
+                            self._gu_check["checked"] += 1
+                            del ref, got
+                    del gbuf
+                gu = store.get(i, "gu")
+            else:
+                gu = torch.mm(y2, self.W_gu.t())
             gated_silu_backward(gu, dact)
             del dact
             dy2 = torch.mm(gu, self.W_gu)
@@ -1167,7 +1252,8 @@ class FastQwen2:
             # attention backward
             if plan.attn:
                 self._ws_use("attn", i)
-            self._weights_ahead(i - 2)
+            if not early_w:
+                self._weights_ahead(i - 2)
             dout = torch.mm(dh16, self.W_o)
             if plan.attn:
                 qkv = store.get(i, "qkv")
@@ -1216,6 +1302,7 @@ class _Batch:
 class _Plan:
     """Per-step choice of what the forward keeps for the backward (see FastQwen2._save_plan)."""
     x = gu = attn = rx = False
+    gu_tail = 0
     arenas = None
     last = 0
 
@@ -1239,6 +1326,10 @@ class _ActStore:
     get(i, kind): the GPU tensor; the main stream waits for its copy. The copy stream is one FIFO
     for both directions, so a host row is never read before it is written, and the next step's
     forward never overwrites a row before this step's backward has read it.
+    keep_rows(i, kind, m) (v13): only rows [0, m) of the tensor went to the host; prefetch copies
+    those rows back into a full-size tensor, whose remaining rows the backward recomputes on the
+    main stream (tail_rows / peek) while the copy is in flight (disjoint rows, so no ordering is
+    needed between the two writers; get() orders the copy before every later read).
     """
 
     IN_FLIGHT = 2
@@ -1247,6 +1338,7 @@ class _ActStore:
         self.m, self.n = model, n
         self.side = model.copy_stream
         self.gpu, self.pending, self.where, self.inflight = {}, {}, {}, {}
+        self.kept = {}
 
     def put(self, i, kind, t, host):
         arena = self.m.host.get(kind) if host and i < self.m.L - 1 else None
@@ -1282,6 +1374,26 @@ class _ActStore:
         self.inflight.setdefault(i, []).append((t, done))
         self.where[(i, kind)] = (arena, t.dtype, tuple(t.shape))
 
+    def keep_rows(self, i, kind, m):
+        """Rows [m, n) of (i, kind) were not copied out (put_rows covered [0, m) only)."""
+        if (i, kind) in self.where and 0 < m < self.n:
+            self.kept[(i, kind)] = int(m)
+
+    def tail_rows(self, i, kind):
+        """How many trailing rows of (i, kind) the caller has to recompute (0 = none)."""
+        m = self.kept.get((i, kind))
+        return 0 if m is None else self.n - m
+
+    def peek(self, i, kind):
+        """The GPU tensor of (i, kind) without waiting for its copy (to write the rows the copy
+        does not cover)."""
+        key = (i, kind)
+        if key in self.gpu:
+            return self.gpu[key]
+        if key not in self.pending:
+            self.prefetch(i, kind)
+        return self.pending[key][0]
+
     def retire(self, upto):
         """Main stream waits for the copies of layers <= upto, then their sources are released."""
         main = torch.cuda.current_stream(self.m.device)
@@ -1295,13 +1407,17 @@ class _ActStore:
         if key in self.gpu or key in self.pending or key not in self.where:
             return
         arena, dtype, shape = self.where.pop(key)
+        m = self.kept.get(key, self.n)
         main = torch.cuda.current_stream(self.m.device)
         g = torch.empty(shape, dtype=dtype, device=self.m.device)
         ready = torch.cuda.Event()
         ready.record(main)
         with torch.cuda.stream(self.side):
             self.side.wait_event(ready)
-            g.copy_(arena[i, :self.n], non_blocking=True)
+            if m == self.n:
+                g.copy_(arena[i, :self.n], non_blocking=True)
+            else:
+                g[:m].copy_(arena[i, :m], non_blocking=True)
             done = torch.cuda.Event()
             done.record(self.side)
         self.pending[key] = (g, done)
@@ -1309,9 +1425,11 @@ class _ActStore:
     def get(self, i, kind):
         key = (i, kind)
         if key in self.gpu:
+            self.kept.pop(key, None)
             return self.gpu.pop(key)
         if key not in self.pending:
             self.prefetch(i, kind)
+        self.kept.pop(key, None)
         g, done = self.pending.pop(key)
         torch.cuda.current_stream(self.m.device).wait_event(done)
         return g
@@ -1321,6 +1439,7 @@ class _ActStore:
         self.gpu.clear()
         self.pending.clear()
         self.where.clear()
+        self.kept.clear()
 
 
 @contextlib.contextmanager
