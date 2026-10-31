@@ -17,6 +17,10 @@ ATTN_IMPL = "varlen"
 
 # Dequantise the next layer's weights on a side stream while the current layer's GEMMs run.
 DEQUANT_OVERLAP = True
+# One workspace region for gate|up and for down, which are never needed at the same time (forward:
+# gate|up GEMM -> SiLU -> down GEMM; backward: down^T GEMM -> SiLU' -> gate|up^T GEMM): the down
+# weights are dequantised into it under the SiLU kernel. Workspace 94 -> 66 MB.
+SHARE_MLP_WS = True
 
 # ---------------------------------------------------------------------------- where things live
 # v6: by default nothing of the model stays on the GPU between uses. Each of these falls back to

@@ -375,7 +375,15 @@ class FastQwen2:
         seg = self.packed[0].segments
         for p in self.packed:
             _require(p.segments == seg, "layers differ in shape")
-        self.ws = torch.empty(self.packed[0].numel, dtype=torch.float16, device=dev)
+        # v14: the down weights share the gate|up region (they are never needed at the same time:
+        # forward gate|up GEMM -> SiLU -> down GEMM, backward down^T GEMM -> SiLU' -> gate|up^T
+        # GEMM), so the workspace is attention + gate|up only (66 MB instead of 94 MB)
+        self.share_mlp = bool(config.SHARE_MLP_WS
+                              and seg["down_proj"][0] == seg["up_proj"][0] + self.I * self.D
+                              and (seg["down_proj"][0] // 64) % RANGE_ALIGN == 0
+                              and (seg["gate_proj"][0] // 64) % RANGE_ALIGN == 0)
+        ws_numel = seg["down_proj"][0] if self.share_mlp else self.packed[0].numel
+        self.ws = torch.empty(ws_numel, dtype=torch.float16, device=dev)
         nqkv = (self.NQ + 2 * self.NKV) * self.HD
 
         def view(name, rows, cols):
@@ -388,7 +396,11 @@ class FastQwen2:
         self.W_qkv = view("q_proj", nqkv, self.D)
         self.W_o = view("o_proj", self.D, self.D)
         self.W_gu = view("gate_proj", 2 * self.I, self.D)
-        self.W_d = view("down_proj", self.D, self.I)
+        if self.share_mlp:
+            g0 = seg["gate_proj"][0]
+            self.W_d = self.ws[g0:g0 + self.D * self.I].view(self.D, self.I)
+        else:
+            self.W_d = view("down_proj", self.D, self.I)
 
         # Dequantisation schedule. The workspace has an attention part (q|k|v|o, the first
         # split_q quantisation blocks) and an MLP part (gate|up|down). We track which layer each
@@ -398,6 +410,7 @@ class FastQwen2:
         # stream as soon as the main stream has issued the last GEMM reading that part (events
         # order the two streams), so the memory-bound dequant runs under the compute-bound GEMMs.
         self.split_q = seg["gate_proj"][0] // 64
+        self.split_d = seg["down_proj"][0] // 64
         _require(self.split_q % RANGE_ALIGN == 0 and seg["o_proj"][0] < seg["gate_proj"][0], "layer split")
         self.ws_have = {"attn": None, "mlp": None}
         self.ev_free = {"attn": torch.cuda.Event(), "mlp": torch.cuda.Event()}
@@ -658,38 +671,59 @@ class FastQwen2:
             for dst, src in zip(self.lora16, self.lora_params):
                 dst.copy_(src)
 
+    # Parts of a layer in the workspace: "attn" (q|k|v|o) has its own region; "mlp" (gate|up|down,
+    # v13 layout) or, with the shared MLP region (v14), "gu" (gate|up) and "dn" (down) take turns
+    # in one region. Each region holds one (layer, part) at a time.
+    @staticmethod
+    def _region(part):
+        return "attn" if part == "attn" else "mlp"
+
+    def _ws_range(self, part, i):
+        """(first, end) quantisation blocks of `part` and where they go in the workspace (None =
+        their own position in the layer layout)."""
+        if part == "attn":
+            return 0, self.split_q, None
+        if part == "mlp":
+            return self.split_q, self.packed[i].n_qblocks, None
+        if part == "gu":
+            return self.split_q, self.split_d, None
+        return self.split_d, self.packed[i].n_qblocks, self.split_q * 64     # "dn": region start
+
     def _ws_load(self, part, i):
-        """Start dequantising `part` ("attn" or "mlp") of layer i into the workspace, unless the
-        workspace already holds (or is already receiving) it. With streamed weights the packed
-        layer is read from its GPU slot; the dequantising stream waits for the slot's copy."""
-        if i is None or self.ws_have[part] == i:
+        """Start dequantising `part` of layer i into its workspace region, unless the region
+        already holds (or is already receiving) it. With streamed weights the packed layer is read
+        from its GPU slot; the dequantising stream waits for the slot's copy."""
+        region = self._region(part)
+        key = i if part in ("attn", "mlp") else (i, part)
+        if i is None or self.ws_have[region] == key:
             return
-        q0, q1 = (0, self.split_q) if part == "attn" else (self.split_q, self.packed[i].n_qblocks)
+        q0, q1, dst = self._ws_range(part, i)
         if self.overlap:
             side = self.dq_stream
-            side.wait_event(self.ev_free[part])         # the main stream's last reader of the part
+            side.wait_event(self.ev_free[region])       # the main stream's last reader of the region
             src = self.pipe.acquire(i, side) if self.pipe is not None else self.packed[i]
             with torch.cuda.stream(side):
-                dequant_range(src, q0, q1, self.code2, self.nf4, self.ws)
-            self.ev_ready[part].record(side)
+                dequant_range(src, q0, q1, self.code2, self.nf4, self.ws, dst=dst)
+            self.ev_ready[region].record(side)
         else:
             main = torch.cuda.current_stream(self.device)
             src = self.pipe.acquire(i, main) if self.pipe is not None else self.packed[i]
-            dequant_range(src, q0, q1, self.code2, self.nf4, self.ws)
-        self.ws_have[part] = i
+            dequant_range(src, q0, q1, self.code2, self.nf4, self.ws, dst=dst)
+        self.ws_have[region] = key
         self.n_dequant += 1
 
     def _ws_use(self, part, i):
         """The main stream is about to read `part` of layer i from the workspace."""
         self._ws_load(part, i)
         if self.overlap:
-            torch.cuda.current_stream(self.device).wait_event(self.ev_ready[part])
+            torch.cuda.current_stream(self.device).wait_event(self.ev_ready[self._region(part)])
 
-    def _ws_release(self, part, nxt):
-        """The main stream has issued its last read of `part`; prefetch layer `nxt`'s part."""
+    def _ws_release(self, part, nxt, nxt_part=None):
+        """The main stream has issued its last read of `part`; prefetch `nxt_part` (default: the
+        same part) of layer `nxt` into the region."""
         if self.overlap:
-            self.ev_free[part].record(torch.cuda.current_stream(self.device))
-        self._ws_load(part, nxt)
+            self.ev_free[self._region(part)].record(torch.cuda.current_stream(self.device))
+        self._ws_load(nxt_part or part, nxt)
 
     def _weights_ahead(self, j):
         """Both halves of the current layer have been queued for dequantisation: its slot may
@@ -958,8 +992,10 @@ class FastQwen2:
             del op
             if plan.rx:
                 x = None                         # not kept: the backward rebuilds it
-            self._ws_use("mlp", i)
-            self._weights_ahead(i + 2)
+            shared = self.share_mlp
+            self._ws_use("gu" if shared else "mlp", i)
+            if not shared:
+                self._weights_ahead(i + 2)
             if config.EARLY_RETIRE:
                 # layer i-1's saved tensors (gate|up above all) leave the GPU before gate|up of
                 # layer i is allocated: its copy was queued right after layer i-1's gate|up GEMM,
@@ -976,21 +1012,30 @@ class FastQwen2:
                     if r1 > r0:
                         torch.mm(y2[r0:r1], self.W_gu.t(), out=gu[r0:r1])
                         store.put_rows(i, "gu", gu, r0, r1)
-                act = torch.empty((n, self.I), dtype=f16, device=dev)
-                gated_silu_forward(gu, act)
             else:
                 gu = torch.mm(y2, self.W_gu.t())
-                act = torch.empty((n, self.I), dtype=f16, device=dev)
-                gated_silu_forward(gu, act)
                 if plan.gu:
                     store.put(i, "gu", gu, True)    # the backward reads it instead of a gate|up GEMM
+            if shared:
+                # gate|up's last read is queued: layer i's down weights go into the same region
+                # under the SiLU, and then every dequant of layer i is queued, so its slot may take
+                # layer i+2
+                self._ws_release("gu", i, "dn")
+                self._weights_ahead(i + 2)
+            act = torch.empty((n, self.I), dtype=f16, device=dev)
+            gated_silu_forward(gu, act)
             del gu
+            if shared:
+                self._ws_use("dn", i)
             d16 = torch.mm(act, self.W_d.t())
             if plan.rx:
                 # the MLP output (fp16) instead of the fp32 layer input: the backward rebuilds the
                 # residual stream from the top, x_i = (x_{i+1} - d_i) - o_i
                 store.put(i, "d", d16, True)
-            self._ws_release("mlp", nxt)
+            if shared:
+                self._ws_release("dn", nxt, "gu")
+            else:
+                self._ws_release("mlp", nxt)
             del act
             x = h1
             self._tl_mark(f"f{i}")
@@ -1150,14 +1195,32 @@ class FastQwen2:
                             dummy16=self.dummy16, dummy32=self.dummy32)
                 rstd2_i, delta2 = rstd2, None
                 del op
-            self._ws_use("mlp", i)
-            gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())
-            # MLP backward
-            dact = torch.mm(dh16, self.W_d)
-            gated_silu_backward(gu, dact)
-            del dact
-            dy2 = torch.mm(gu, self.W_gu)
-            self._ws_release("mlp", prv)        # layer i-1's MLP weights dequantise under the attention backward
+            if self.share_mlp:
+                if plan.gu:
+                    gu = store.get(i, "gu")
+                else:
+                    self._ws_use("gu", i)
+                    gu = torch.mm(y2, self.W_gu.t())
+                    self._ws_release("gu", i, "dn")
+                # MLP backward: down^T, then gate|up of the same layer into the region under the
+                # SiLU backward, then gate|up^T; layer i-1's down weights under the attention backward
+                self._ws_use("dn", i)
+                dact = torch.mm(dh16, self.W_d)
+                self._ws_release("dn", i, "gu")
+                gated_silu_backward(gu, dact)
+                del dact
+                self._ws_use("gu", i)
+                dy2 = torch.mm(gu, self.W_gu)
+                self._ws_release("gu", prv, "dn")
+            else:
+                self._ws_use("mlp", i)
+                gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())
+                # MLP backward
+                dact = torch.mm(dh16, self.W_d)
+                gated_silu_backward(gu, dact)
+                del dact
+                dy2 = torch.mm(gu, self.W_gu)
+                self._ws_release("mlp", prv)    # layer i-1's MLP weights dequantise under the attention backward
             del gu
             if plan.gu and i > 0:
                 store.prefetch(i - 1, "gu")     # into the block gu just released

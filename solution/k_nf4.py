@@ -190,7 +190,7 @@ def dequant_layer(layer, code2, nf4, out):
 RANGE_ALIGN = 1024   # quantisation blocks: keeps every sliced section pointer 16-byte aligned
 
 
-def dequant_range(layer, q0, q1, code2, nf4, out):
+def dequant_range(layer, q0, q1, code2, nf4, out, dst=None):
     """Dequantise quantisation blocks [q0, q1) of `layer` into the same positions of `out` (the
     flat workspace). q0 and q1 must be multiples of RANGE_ALIGN (or q1 the layer end), so that the
     sliced packed / absmax / scale pointers stay 16-byte aligned like the ones the kernel was
@@ -198,8 +198,11 @@ def dequant_range(layer, q0, q1, code2, nf4, out):
     if q0 % RANGE_ALIGN or (q1 % RANGE_ALIGN and q1 != layer.n_qblocks):
         raise ValueError("dequant range not aligned")
     s0, s1 = q0 // 256, -(-q1 // 256)
+    start = q0 * 64 if dst is None else int(dst)   # dst: element offset in `out` (shared region)
+    if start % (RANGE_ALIGN * 64):
+        raise ValueError("dequant destination not aligned")
     return dequant_tensors(layer.packed[q0 * 32:q1 * 32], layer.qabs[q0:q1], layer.scale2[s0:s1],
-                           layer.offset2[s0:s1], q1 - q0, code2, nf4, out[q0 * 64:q1 * 64])
+                           layer.offset2[s0:s1], q1 - q0, code2, nf4, out[start:start + (q1 - q0) * 64])
 
 
 class SlotView:
