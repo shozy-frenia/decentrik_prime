@@ -21,6 +21,9 @@ DEQUANT_OVERLAP = True
 # gate|up GEMM -> SiLU -> down GEMM; backward: down^T GEMM -> SiLU' -> gate|up^T GEMM): the down
 # weights are dequantised into it under the SiLU kernel. Workspace 94 -> 66 MB.
 SHARE_MLP_WS = True
+# v16: ... and gate and up take turns in it as well (gate GEMM, up GEMM, then down), so the region
+# holds one I x D matrix: workspace 66 -> 38 MB. The up weights dequantise after the gate GEMM.
+SPLIT_GU_WS = True
 
 # ---------------------------------------------------------------------------- where things live
 # v6: by default nothing of the model stays on the GPU between uses. Each of these falls back to
@@ -109,6 +112,10 @@ CUBLAS_SMALL_WORKSPACE = True
 # AdamW's moment buffers (17 MB) in pinned host memory between optimizer steps, copied in before
 # and out after each step by optimizer step hooks (optstate.py; cleared with the organisers, Q50).
 OFFLOAD_OPTIMIZER = True
+# PyTorch allocator setting expandable_segments:True (v16): reserved memory follows the live
+# tensors more closely (no reserved-but-unusable segment slack). Not ruled on by the organisers
+# yet; set False if they object.
+ALLOC_EXPANDABLE = True
 # Let HF Trainer's per-step walks over the model (model.parameters() in gradient clipping,
 # model.zero_grad()) use lists taken once at the start of training: same parameters in the same
 # order, and only the trainable ones can hold a gradient to clear (checked when installed).

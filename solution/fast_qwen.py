@@ -384,7 +384,14 @@ class FastQwen2:
                               and seg["down_proj"][0] == seg["up_proj"][0] + self.I * self.D
                               and (seg["down_proj"][0] // 64) % RANGE_ALIGN == 0
                               and (seg["gate_proj"][0] // 64) % RANGE_ALIGN == 0)
-        ws_numel = seg["down_proj"][0] if self.share_mlp else self.packed[0].numel
+        # v16: gate and up take turns too (gate GEMM -> up GEMM -> SiLU -> down GEMM), so the MLP
+        # region holds one I x D matrix: 66 -> 38 MB
+        self.split_gu = bool(self.share_mlp and config.SPLIT_GU_WS
+                             and (seg["up_proj"][0] // 64) % RANGE_ALIGN == 0)
+        if self.split_gu:
+            ws_numel = seg["up_proj"][0]
+        else:
+            ws_numel = seg["down_proj"][0] if self.share_mlp else self.packed[0].numel
         self.ws = torch.empty(ws_numel, dtype=torch.float16, device=dev)
         nqkv = (self.NQ + 2 * self.NKV) * self.HD
 
@@ -397,7 +404,13 @@ class FastQwen2:
         _require(seg["up_proj"][0] == seg["gate_proj"][0] + self.I * self.D, "gate/up order")
         self.W_qkv = view("q_proj", nqkv, self.D)
         self.W_o = view("o_proj", self.D, self.D)
-        self.W_gu = view("gate_proj", 2 * self.I, self.D)
+        g0 = seg["gate_proj"][0]
+        if self.split_gu:
+            self.W_gu = None
+            self.W_g = self.ws[g0:g0 + self.I * self.D].view(self.I, self.D)
+            self.W_u = self.W_g                        # same region, the up rows after the gate's
+        else:
+            self.W_gu = view("gate_proj", 2 * self.I, self.D)
         if self.share_mlp:
             g0 = seg["gate_proj"][0]
             self.W_d = self.ws[g0:g0 + self.D * self.I].view(self.D, self.I)
@@ -413,6 +426,7 @@ class FastQwen2:
         # order the two streams), so the memory-bound dequant runs under the compute-bound GEMMs.
         self.split_q = seg["gate_proj"][0] // 64
         self.split_d = seg["down_proj"][0] // 64
+        self.split_u = seg["up_proj"][0] // 64
         _require(self.split_q % RANGE_ALIGN == 0 and seg["o_proj"][0] < seg["gate_proj"][0], "layer split")
         self.ws_have = {"attn": None, "mlp": None}
         self.ev_free = {"attn": torch.cuda.Event(), "mlp": torch.cuda.Event()}
@@ -693,6 +707,10 @@ class FastQwen2:
             return self.split_q, self.packed[i].n_qblocks, None
         if part == "gu":
             return self.split_q, self.split_d, None
+        if part == "g":
+            return self.split_q, self.split_u, None
+        if part == "u":
+            return self.split_u, self.split_d, self.split_q * 64
         return self.split_d, self.packed[i].n_qblocks, self.split_q * 64     # "dn": region start
 
     def _ws_load(self, part, i):
@@ -1035,8 +1053,9 @@ class FastQwen2:
             del op
             if plan.rx:
                 x = None                         # not kept: the backward rebuilds it
-            shared = self.share_mlp
-            self._ws_use("gu" if shared else "mlp", i)
+            shared, split = self.share_mlp, self.split_gu
+            I = self.I
+            self._ws_use("g" if split else ("gu" if shared else "mlp"), i)
             if not shared:
                 self._weights_ahead(i + 2)
             if config.EARLY_RETIRE:
@@ -1056,19 +1075,34 @@ class FastQwen2:
                 # GEMM is done, so layer i's copy is complete when layer i+1 retires it (above)
                 gu = torch.empty((n, 2 * self.I), dtype=f16, device=dev)
                 edges = [0] + [min(n, -(-(n * k // parts) // 16) * 16) for k in range(1, parts)] + [n]
+                if split:
+                    # gate for all rows, then up in row blocks (each block's copy starts at once)
+                    torch.mm(y2, self.W_g.t(), out=gu[:, :I])
+                    self._ws_release("g", i, "u")
+                    self._ws_use("u", i)
                 for r0, r1 in zip(edges[:-1], edges[1:]):
                     if r1 > r0:
-                        torch.mm(y2[r0:r1], self.W_gu.t(), out=gu[r0:r1])
+                        if split:
+                            torch.mm(y2[r0:r1], self.W_u.t(), out=gu[r0:r1, I:])
+                        else:
+                            torch.mm(y2[r0:r1], self.W_gu.t(), out=gu[r0:r1])
                         store.put_rows(i, "gu", gu, r0, r1)
             else:
-                gu = torch.mm(y2, self.W_gu.t())
+                if split:
+                    gu = torch.empty((n, 2 * I), dtype=f16, device=dev)
+                    torch.mm(y2, self.W_g.t(), out=gu[:, :I])
+                    self._ws_release("g", i, "u")
+                    self._ws_use("u", i)
+                    torch.mm(y2, self.W_u.t(), out=gu[:, I:])
+                else:
+                    gu = torch.mm(y2, self.W_gu.t())
                 if plan.gu:
                     store.put(i, "gu", gu, True)    # the backward reads it instead of a gate|up GEMM
             if shared:
                 # gate|up's last read is queued: layer i's down weights go into the same region
                 # under the SiLU, and then every dequant of layer i is queued, so its slot may take
                 # layer i+2
-                self._ws_release("gu", i, "dn")
+                self._ws_release("u" if split else "gu", i, "dn")
                 self._weights_ahead(i + 2)
             act = torch.empty((n, self.I), dtype=f16, device=dev)
             gated_silu_forward(gu, act)
@@ -1081,7 +1115,7 @@ class FastQwen2:
                 # residual stream from the top, x_i = (x_{i+1} - d_i) - o_i
                 store.put(i, "d", d16, True)
             if shared:
-                self._ws_release("dn", nxt, "gu")
+                self._ws_release("dn", nxt, "g" if split else "gu")
             else:
                 self._ws_release("mlp", nxt)
             del act
@@ -1254,9 +1288,18 @@ class FastQwen2:
                             dummy16=self.dummy16, dummy32=self.dummy32)
                 rstd2_i, delta2 = rstd2, None
                 del op
+            split, I = self.split_gu, self.I
             if self.share_mlp:
                 if plan.gu:
                     gu = store.get(i, "gu")
+                elif split:
+                    self._ws_use("g", i)
+                    gu = torch.empty((n, 2 * I), dtype=f16, device=dev)
+                    torch.mm(y2, self.W_g.t(), out=gu[:, :I])
+                    self._ws_release("g", i, "u")
+                    self._ws_use("u", i)
+                    torch.mm(y2, self.W_u.t(), out=gu[:, I:])
+                    self._ws_release("u", i, "dn")
                 else:
                     self._ws_use("gu", i)
                     gu = torch.mm(y2, self.W_gu.t())
@@ -1265,14 +1308,24 @@ class FastQwen2:
                 # SiLU backward, then gate|up^T; layer i-1's down weights under the attention backward
                 self._ws_use("dn", i)
                 dact = torch.mm(dh16, self.W_d)
-                self._ws_release("dn", i, "gu")
+                self._ws_release("dn", i, "g" if split else "gu")
                 gated_silu_backward(gu, dact)
                 del dact
                 if plan.attn:
                     norm1_again()               # into the block dact has just released
-                self._ws_use("gu", i)
-                dy2 = torch.mm(gu, self.W_gu)
-                self._ws_release("gu", prv, "dn")
+                if split:
+                    # d(norm-2 output) = dgate W_g + dup W_u, summed in fp16 as autograd sums the
+                    # base's gate_proj and up_proj input gradients
+                    self._ws_use("g", i)
+                    dy2 = torch.mm(gu[:, :I], self.W_g)
+                    self._ws_release("g", i, "u")
+                    self._ws_use("u", i)
+                    dy2.add_(torch.mm(gu[:, I:], self.W_u))
+                    self._ws_release("u", prv, "dn")
+                else:
+                    self._ws_use("gu", i)
+                    dy2 = torch.mm(gu, self.W_gu)
+                    self._ws_release("gu", prv, "dn")
             else:
                 self._ws_use("mlp", i)
                 gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())

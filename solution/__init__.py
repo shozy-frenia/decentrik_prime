@@ -32,6 +32,17 @@ def apply():
         import os
         # read by PyTorch when it creates the first cuBLAS workspace (no GEMM has run yet)
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+    if config.FAST_PATH and config.ALLOC_EXPANDABLE:
+        # PyTorch's caching allocator grows one segment page by page instead of keeping many
+        # fixed-size segments (less reserved-but-unused memory); nothing it computes changes
+        import os
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        except Exception:  # noqa: BLE001 - the default allocator settings stay
+            pass
     precompile.start()           # compile our kernels while Soup imports, tokenises and loads
     if config.FAST_PATH and config.EARLY_PINNED:
         try:
