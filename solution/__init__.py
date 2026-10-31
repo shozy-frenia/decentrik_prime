@@ -15,14 +15,21 @@ See README.md for what the kernels do and why. Files:
     integration.py  the patches into transformers' loading, PEFT and Soup, the replacement compute_loss
     hostmem.py    pinned host buffers allocated in the background as soon as apply() runs
     precompile.py   background compilation of the kernels while Soup loads
+    profile_setup.py  sampling profile of the main thread outside the training steps (log only)
     config.py     switches
 """
 
 
 
 def apply():
-    from . import config, integration, precompile
+    from . import config, integration, precompile, profile_setup
 
+    profile_setup.start()        # where the time outside the training steps goes (log only)
+    if config.GC_TUNE:
+        import gc
+        # fewer cyclic-GC passes while Soup imports its stack and builds the run (every pass of
+        # the oldest generation walks millions of objects); frozen at the first training step
+        gc.set_threshold(max(gc.get_threshold()[0], 50000), *gc.get_threshold()[1:])
     precompile.start()           # compile our kernels while Soup imports, tokenises and loads
     if config.FAST_PATH and config.EARLY_PINNED:
         try:

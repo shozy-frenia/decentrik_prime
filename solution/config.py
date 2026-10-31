@@ -96,3 +96,17 @@ FP16_EMBEDDING = True
 
 # Print one line per phase (setup, first steps) to the training log.
 VERBOSE = True
+
+# Sample the main thread's Python stack every 20 ms outside the training steps (from apply() to
+# the first step, and from the end of the training loop to exit) and print where the time went
+# (solution/profile_setup.py). Log only; it changes nothing the run computes.
+SETUP_PROFILE = True
+
+# Python's cyclic GC: a higher generation-0 threshold from apply() on (fewer full passes over the
+# millions of objects Soup's imports create), and gc.freeze() at the first training step. Changes
+# when garbage cycles are collected, nothing else (reference counting frees tensors as before).
+GC_TUNE = True
+
+# Experimental (A/B in dev/check_fast_path.py): run the layer GEMMs through cuBLASLt instead of
+# cuBLAS (torch.backends.cuda.preferred_blas_library), set around our forward and backward only.
+BLAS_LT = False

@@ -417,6 +417,30 @@ def _install_on_trainer(trainer, runner):
         return orig_log(*args, **kwargs)
 
     trainer.log = log
+    # timeline of the wrap-up (and the setup profiler's phase switch); nothing else changes
+    try:
+        import transformers
+
+        class _Timeline(transformers.TrainerCallback):
+            def on_train_end(self, args, state, control, **kwargs):
+                from . import profile_setup
+                _log("training loop done")
+                profile_setup.phase("wrapup")
+
+        trainer.add_callback(_Timeline())
+        orig_save = trainer.save_model
+
+        @functools.wraps(orig_save)
+        def save_model(*args, **kwargs):
+            _log("save_model starts")
+            try:
+                return orig_save(*args, **kwargs)
+            finally:
+                _log("save_model done")
+
+        trainer.save_model = save_model
+    except Exception as exc:  # noqa: BLE001 - logging only
+        _log(f"timeline hooks not installed: {type(exc).__name__}: {exc}")
     _log("fast compute_loss installed")
     return True
 
@@ -456,6 +480,14 @@ def fast_compute_loss(self, model, inputs, return_outputs=False, num_items_in_ba
     from .fast_qwen import run_step
 
     runner.flush()
+    if runner.steps == 0:
+        from . import profile_setup
+        profile_setup.phase(None)         # the setup profile ends at the first step
+        profile_setup.report("setup")
+        if config.GC_TUNE:
+            import gc
+            gc.freeze()                   # setup's objects never get scanned again by the GC
+        _log("first step starts")
     batch = runner.pack(inputs["input_ids"], inputs["attention_mask"], inputs["labels"])
     if batch is None:
         return _stock_compute_loss(self, model, inputs, return_outputs, num_items_in_batch)

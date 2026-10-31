@@ -27,6 +27,7 @@ tokens. How it is computed changes:
 * the tied embedding is stored in fp16 (bit-exact, see integration.py).
 """
 
+import contextlib
 import math
 import threading
 import time
@@ -844,6 +845,11 @@ class FastQwen2:
         xv = torch.empty((n, D), dtype=f16, device=dev)
         y2 = torch.empty((n, D), dtype=f16, device=dev)
         rstd = torch.empty(n, dtype=f32, device=dev)
+        # norm 2's rstd per layer (4 bytes per token): with gate|up kept, the backward needs no
+        # norm-2 recompute at all (rms_backward adds the O output to the checkpoint in registers)
+        # (rows padded to 16 bytes: Triton specialises pointers on 16-byte alignment, and an
+        # unaligned row would compile another variant of the norm kernels mid-run)
+        rstd2_all = torch.empty((self.L, -(-n // 4) * 4), dtype=f32, device=dev)[:, :n]
         x = batch.x0.float()
         batch.x0 = None
         d16 = None
@@ -874,9 +880,12 @@ class FastQwen2:
                 store.put(i, "out", out, True)
                 store.put(i, "op", op, True)
                 store.put(i, "actx", actx[4:], False)       # logsumexp, philox seed/offset
+                # the rank-16 LoRA-A projections (64 bytes per token): no recompute GEMMs later
+                store.put(i, "aq", _aq, False)
+                store.put(i, "av", _av, False)
             del qkv, _aq, _av, out, actx
             h1 = torch.empty((n, D), dtype=f32, device=dev)
-            rms_forward(x, self.w_post[i], y2, rstd, self.eps, delta=op, xout=h1,
+            rms_forward(x, self.w_post[i], y2, rstd2_all[i], self.eps, delta=op, xout=h1,
                         dummy16=self.dummy16, dummy32=self.dummy32)
             del op
             self._ws_use("mlp", i)
@@ -904,15 +913,17 @@ class FastQwen2:
         batch.e_target = None
         self.steps += 1
         saved = dict(store=store, plan=plan, hf=hf, rstd_f=rstd_f, dy_head=dy_head, seeds=seeds,
-                     batch=batch)
+                     batch=batch, rstd2=rstd2_all)
         return loss_sum, stats, saved
 
     def _head(self, yf, batch):
-        if self.head_impl == "rows":
-            return fused_head(yf, self.emb, batch.tgt_sorted, batch.perm, batch.inv, batch.n_lab,
-                              config.HEAD_CHUNK, config.HEAD_GRAD_SCALE)
-        return streamed_head(yf, self.emb_source, batch.tgt_sorted, batch.perm, batch.n_lab,
-                             batch.e_target, config.HEAD_GRAD_SCALE, self.dummy32)
+        # the head's GEMMs (incl. the fp32-accumulating one) keep PyTorch's default library choice
+        with _blas("default" if config.BLAS_LT else None):
+            if self.head_impl == "rows":
+                return fused_head(yf, self.emb, batch.tgt_sorted, batch.perm, batch.inv, batch.n_lab,
+                                  config.HEAD_CHUNK, config.HEAD_GRAD_SCALE)
+            return streamed_head(yf, self.emb_source, batch.tgt_sorted, batch.perm, batch.n_lab,
+                                 batch.e_target, config.HEAD_GRAD_SCALE, self.dummy32)
 
     # ------------------------------------------------------------------ backward
     def backward(self, saved, g_loss):
@@ -925,12 +936,14 @@ class FastQwen2:
         dh16 = torch.empty((n, D), dtype=f16, device=dev)     # fp16 copy of dh for the GEMMs
         rms_backward(saved.pop("dy_head"), gscale, saved.pop("hf"), self.w_final, saved.pop("rstd_f"),
                      dh, out16=dh16, dummy16=self.dummy16, dummy32=self.dummy32)
-        y = torch.empty((n, D), dtype=f16, device=dev)
+        # y / y2 (the GEMM inputs of norm 1 / norm 2) only for what is recomputed
+        y = None if plan.attn else torch.empty((n, D), dtype=f16, device=dev)
         xq = torch.empty((n, D), dtype=f16, device=dev)
         xv = torch.empty((n, D), dtype=f16, device=dev)
-        y2 = torch.empty((n, D), dtype=f16, device=dev)
+        y2 = None if plan.gu else torch.empty((n, D), dtype=f16, device=dev)
         rstd1 = torch.empty(n, dtype=f32, device=dev)
         rstd2 = torch.empty(n, dtype=f32, device=dev)
+        rstd2_all = saved.pop("rstd2")
         grads = [None] * len(self.lora_params)
         s = self.lora_scale
         for i in reversed(range(self.L)):
@@ -940,22 +953,30 @@ class FastQwen2:
                 store.prefetch(i - 1, "op")
             aq16, bq16, av16, bv16 = self.lora16[4 * i:4 * i + 4]
             prv = i - 1 if i > 0 else None
-            # norm 1 again: the dropout-masked LoRA inputs (same Philox seeds) and rstd
-            rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv, p_drop=self.p_drop,
-                        keep_scale=self.keep_scale, seed_q=seeds[2 * i], seed_v=seeds[2 * i + 1],
-                        dummy16=self.dummy16, dummy32=self.dummy32)
+            # norm 1 again: the dropout-masked LoRA inputs (same Philox seeds) and rstd; y itself
+            # only when the attention is recomputed
+            rms_forward(x, self.w_in[i], y, rstd1, self.eps, xq=xq, xv=xv,
+                        p_drop=self.p_drop, keep_scale=self.keep_scale, seed_q=seeds[2 * i],
+                        seed_v=seeds[2 * i + 1], dummy16=self.dummy16, dummy32=self.dummy32)
             if plan.attn:
-                aq = torch.mm(xq, aq16.t())
-                av = torch.mm(xv, av16.t())
+                aq = store.get(i, "aq")
+                av = store.get(i, "av")
                 op = store.get(i, "op")
             else:
                 self._ws_use("attn", i)
                 qkv, aq, av, out, actx = self._attn_part(i, y, xq, xv, batch, grad=True)
                 op = torch.mm(out, self.W_o.t())
-            h1 = torch.empty((n, D), dtype=f32, device=dev)
-            rms_forward(x, self.w_post[i], y2, rstd2, self.eps, delta=op, xout=h1,
-                        dummy16=self.dummy16, dummy32=self.dummy32)
-            del op
+            if plan.gu:
+                # norm 2's input is x + op: rms_backward rebuilds it in registers, with the
+                # forward's rstd; nothing of norm 2 is recomputed
+                h1, rstd2_i, delta2 = x, rstd2_all[i], op
+                del op
+            else:
+                h1 = torch.empty((n, D), dtype=f32, device=dev)
+                rms_forward(x, self.w_post[i], y2, rstd2, self.eps, delta=op, xout=h1,
+                            dummy16=self.dummy16, dummy32=self.dummy32)
+                rstd2_i, delta2 = rstd2, None
+                del op
             self._ws_use("mlp", i)
             gu = store.get(i, "gu") if plan.gu else torch.mm(y2, self.W_gu.t())
             # MLP backward
@@ -967,9 +988,9 @@ class FastQwen2:
             del gu
             if plan.gu and i > 0:
                 store.prefetch(i - 1, "gu")     # into the block gu just released
-            rms_backward(dy2, self.one, h1, self.w_post[i], rstd2, dh, dres=dh, out16=dh16,
-                         dummy16=self.dummy16, dummy32=self.dummy32)
-            del dy2, h1
+            rms_backward(dy2, self.one, h1, self.w_post[i], rstd2_i, dh, dres=dh, out16=dh16,
+                         delta=delta2, dummy16=self.dummy16, dummy32=self.dummy32)
+            del dy2, h1, delta2
             # attention backward
             if plan.attn:
                 self._ws_use("attn", i)
@@ -1110,12 +1131,32 @@ class _ActStore:
         self.where.clear()
 
 
+@contextlib.contextmanager
+def _blas(backend):
+    """Prefer cuBLAS or cuBLASLt for the GEMMs inside the block (config.BLAS_LT); None = as is."""
+    prev = None
+    if backend is not None:
+        try:
+            prev = torch.backends.cuda.preferred_blas_library()
+            if str(prev).lower().endswith(backend):
+                prev = None
+            else:
+                torch.backends.cuda.preferred_blas_library(backend)
+        except Exception:  # noqa: BLE001 - not available: keep the default
+            prev = None
+    try:
+        yield
+    finally:
+        if prev is not None:
+            torch.backends.cuda.preferred_blas_library(prev)
+
+
 class FusedCausalLM(torch.autograd.Function):
     """Whole-model autograd node: inputs are the LoRA parameters, output the summed CE."""
 
     @staticmethod
     def forward(ctx, runner, batch, *lora_params):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast("cuda", enabled=False), _blas("cublaslt" if config.BLAS_LT else None):
             loss_sum, stats, saved = runner.forward(batch)
         ctx.runner, ctx.saved = runner, saved
         ctx.mark_non_differentiable(stats)
@@ -1123,7 +1164,7 @@ class FusedCausalLM(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g_loss, _g_stats):
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast("cuda", enabled=False), _blas("cublaslt" if config.BLAS_LT else None):
             grads = ctx.runner.backward(ctx.saved, g_loss)
         ctx.saved = None
         return (None, None, *grads)

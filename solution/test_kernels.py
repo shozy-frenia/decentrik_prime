@@ -184,6 +184,23 @@ def test_rmsnorm_forward_backward_and_dropout():
                  seed_q=123, seed_v=456, out16=out16, dummy16=d16, dummy32=d32)
     _close(out, hh.grad + dres.double(), 1e-4, 1e-4, "rms backward")
     assert torch.equal(out16, out.half())
+    # v7: the backward given the norm input as x + delta (no recomputed h) is bit-identical
+    out_d = dres.clone()
+    out16_d = torch.empty_like(out16)
+    rms_backward(dy16, gscale, x, w, rstd, out_d, dres=out_d, lq=lq, lv=lv, p_drop=p, keep_scale=ks,
+                 seed_q=123, seed_v=456, out16=out16_d, delta=delta, dummy16=d16, dummy32=d32)
+    assert torch.equal(out_d, out) and torch.equal(out16_d, out16)
+    # v7: the forward without y (the backward's norm-1 recompute) writes the same rstd and masks
+    y_keep = torch.full_like(y, 3.0)
+    rstd3, xq3, xv3 = torch.empty_like(rstd), torch.empty_like(y), torch.empty_like(y)
+    rms_forward(x, w, None, rstd3, eps, delta=delta, xq=xq3, xv=xv3, p_drop=p, keep_scale=ks,
+                seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+    rstd_ref = torch.empty_like(rstd)
+    rms_forward(x, w, y_keep, rstd_ref, eps, delta=delta, xq=xq2, xv=xv2, p_drop=p, keep_scale=ks,
+                seed_q=123, seed_v=456, dummy16=d16, dummy32=d32)
+    assert torch.equal(rstd3, rstd_ref) and torch.equal(xq3, xq2) and torch.equal(xv3, xv2)
+    # dummy16 must be large enough for nothing: y=None never writes through the dummy
+    assert torch.equal(d16, torch.zeros_like(d16))
 
 
 # ------------------------------------------------------------------ QKV epilogue (LoRA add + RoPE)
