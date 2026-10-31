@@ -71,10 +71,6 @@ def test_nf4():
 
 
 # ------------------------------------------------------------------ RMSNorm
-def rand_mask(seed, off, p):
-    return tl_emu.rand(seed, off).a >= p
-
-
 def test_norm():
     print("rmsnorm fwd/bwd")
     n, d = 5, 1536
@@ -87,7 +83,11 @@ def test_norm():
     rstd = np.zeros(n, f32)
     xq = np.zeros((n, d), f16)
     xv = np.zeros((n, d), f16)
-    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y, rstd, xq, xv, n, eps, p, ks, 11, 22, 1, 1, 1, 1,
+    # v15: the keep-masks are inputs (PyTorch's dropout masks, uint8)
+    mq = rng.uniform(size=(n, d)) >= p
+    mv = rng.uniform(size=(n, d)) >= p
+    mq8, mv8 = mq.astype(np.uint8), mv.astype(np.uint8)
+    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y, rstd, xq, xv, mq8, mv8, n, eps, ks, 1, 1, 1, 1,
                                 D=d, BLOCK=2048)
     h = x + delta.astype(f32)
     r = 1.0 / np.sqrt((h.astype(np.float64) ** 2).mean(1) + eps)
@@ -96,22 +96,20 @@ def test_norm():
     check("rstd", rstd, r, 0, 1e-6)
     rstd_first = rstd.copy()
     check("y fp16", y, yr, 1e-3, 2e-3)
-    off = (np.arange(n)[:, None] * d + np.arange(d)[None, :]).astype(np.int32)
-    mq, mv = rand_mask(11, off, p), rand_mask(22, off, p)
     check("dropout q", xq, np.where(mq, yr * ks, 0), 1e-3, 2e-3)
     check("dropout v", xv, np.where(mv, yr * ks, 0), 1e-3, 2e-3)
     print(f"     keep rate q {mq.mean():.4f} v {mv.mean():.4f} (expected 0.95), q/v masks differ "
           f"{(mq != mv).mean():.3f}")
     # without delta / write / dropout
     y2 = np.zeros((n, d), f16)
-    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y2, rstd, xq, xv, n, eps, p, ks, 11, 22, 0, 0, 0, 1,
+    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y2, rstd, xq, xv, mq8, mv8, n, eps, ks, 0, 0, 0, 1,
                                 D=d, BLOCK=2048)
     r2 = 1.0 / np.sqrt((x.astype(np.float64) ** 2).mean(1) + eps)
     check("y (no delta)", y2, w * (x * r2[:, None]), 1e-3, 2e-3)
     # y not written (write_y = 0): rstd and the dropout outputs are identical, y untouched
     y3 = np.full((n, d), 7, f16)
     xq3, xv3, rstd3 = np.zeros_like(xq), np.zeros_like(xv), np.zeros(n, f32)
-    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y3, rstd3, xq3, xv3, n, eps, p, ks, 11, 22, 1, 0, 1, 0,
+    k_norm.rms_fwd_kernel[(n,)](x, delta, xout, w, y3, rstd3, xq3, xv3, mq8, mv8, n, eps, ks, 1, 0, 1, 0,
                                 D=d, BLOCK=2048)
     check("write_y=0: y untouched", y3, np.full((n, d), 7, f16), 0)
     check("write_y=0: rstd identical", rstd3, rstd_first, 0)
@@ -126,8 +124,8 @@ def test_norm():
     gscale = np.array([0.75], f32)
     out = dres.copy()
     out16 = np.zeros((n, d), f16)
-    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, h, delta, w, r.astype(f32), out, out, lq, lv, out16, n, p, ks,
-                                11, 22, 1, 1, 1, 0, D=d, BLOCK=2048)
+    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, h, delta, w, r.astype(f32), out, out, lq, lv, out16, mq8, mv8,
+                                n, ks, 1, 1, 1, 0, D=d, BLOCK=2048)
     dyt = dy16.astype(np.float64) * 0.75 + np.where(mq, lq.astype(np.float64) * ks, 0) + np.where(mv, lv.astype(np.float64) * ks, 0)
     hh = h.astype(np.float64)
     rr = 1.0 / np.sqrt((hh ** 2).mean(1) + eps)
@@ -139,8 +137,8 @@ def test_norm():
     # the same backward with the norm input given as x + delta (no recomputed h): bit-identical
     out_d = dres.copy()
     out16_d = np.zeros((n, d), f16)
-    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, x, delta, w, r.astype(f32), out_d, out_d, lq, lv, out16_d, n,
-                                p, ks, 11, 22, 1, 1, 1, 1, D=d, BLOCK=2048)
+    k_norm.rms_bwd_kernel[(n,)](dy16, gscale, x, delta, w, r.astype(f32), out_d, out_d, lq, lv, out16_d,
+                                mq8, mv8, n, ks, 1, 1, 1, 1, D=d, BLOCK=2048)
     check("rms bwd from x + delta == from h (bit-exact)", out_d, out, 0)
     check("rms bwd from x + delta: fp16 copy bit-exact", out16_d, out16, 0)
     # finite-difference check of the analytic formula on one row

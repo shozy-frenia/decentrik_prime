@@ -66,15 +66,16 @@ def layer_kernels(n):
     xo = torch.empty(n, D, device=DEV)
     rstd = torch.empty(n, device=DEV)
     delta = torch.randn(n, D, device=DEV).half()
+    mq = (torch.rand(n, D, device=DEV) >= 0.05).view(torch.uint8)
     out = {}
     out["rms_fwd_dropout"] = bench(lambda: rms_forward(x, w, y, rstd, 1e-6, delta=delta, xout=xo, xq=xq, xv=xv,
-                                                       p_drop=0.05, keep_scale=1 / 0.95, seed_q=1, seed_v=2,
+                                                       mq=mq, mv=mq, keep_scale=1 / 0.95,
                                                        dummy16=d16, dummy32=d32))
     dh = torch.randn(n, D, device=DEV)
     dh16 = torch.empty(n, D, dtype=f16, device=DEV)
     one = torch.ones(1, device=DEV)
     out["rms_bwd_lora"] = bench(lambda: rms_backward(delta, one, x, w, rstd, dh, dres=dh, lq=delta, lv=delta,
-                                                     p_drop=0.05, keep_scale=1 / 0.95, seed_q=1, seed_v=2,
+                                                     mq=mq, mv=mq, keep_scale=1 / 0.95,
                                                      out16=dh16, dummy16=d16, dummy32=d32))
     qkv = torch.randn(n, 2048, device=DEV).half()
     lq = torch.randn(n, 1536, device=DEV).half()
